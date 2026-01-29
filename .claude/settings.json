@@ -1,0 +1,42 @@
+{
+  "defaultMode": "acceptEdits",
+  "permissions": {
+    "allow": [
+      "Bash(uv sync*)",
+      "Bash(uv run *)",
+      "Bash(uv pip *)",
+      "Bash(uv tree*)",
+      "Bash(uv lock*)",
+      "Bash(ruff *)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git branch*)",
+      "Bash(git show*)",
+      "Bash(git rev-parse*)",
+      "Bash(git remote*)",
+      "Bash(git ls-files*)",
+      "Bash(ls *)",
+      "Bash(pwd)",
+      "Bash(which *)",
+      "Bash(tree *)",
+      "Bash(source .venv/bin/activate)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(nix develop*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path' | { read file_path; if echo \"$file_path\" | grep -qE '\\.py$'; then uv run ruff format --quiet \"$file_path\" 2>/dev/null; fi; } || true"
+          }
+        ]
+      }
+    ]
+  }
+}

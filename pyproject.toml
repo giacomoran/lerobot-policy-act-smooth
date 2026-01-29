@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "lerobot @ git+https://github.com/huggingface/lerobot.git@46e19ae579f80ce66211afafd1c3c649c569131f",
+  "lerobot[feetech] @ git+https://github.com/huggingface/lerobot.git@46e19ae579f80ce66211afafd1c3c649c569131f",
 ]
 
 [dependency-groups]

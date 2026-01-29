@@ -1,0 +1,23 @@
+[project]
+name = "lerobot-policy-act-smooth"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = ["pdbpp>=0.11.7", "ruff>=0.14.11"]
+
+[tool.uv]
+# Force av to be compiled from source so it links against the system FFmpeg
+# (installed via Nix) instead of using pre-built wheels with bundled FFmpeg
+no-binary-package = ["av"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+ignore = [
+  "F541", # f-string without any placeholders
+]

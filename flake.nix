@@ -17,6 +17,7 @@
       {
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
+            python311
             ffmpeg-pkg
             uv
             # Required for building PyAV against system ffmpeg
@@ -33,6 +34,9 @@
             # Ensure torchcodec finds nix-installed ffmpeg libs (runtime)
             # Use .lib output which contains the actual shared libraries
             export DYLD_LIBRARY_PATH="${ffmpeg-pkg.lib}/lib:$DYLD_LIBRARY_PATH"
+
+            # Tell uv to use nix's Python (avoids homebrew library path issues)
+            export UV_PYTHON="${pkgs.python311}/bin/python3.11"
           '';
         };
       }

@@ -9,7 +9,7 @@
 #   - robot.cameras: Camera indices depend on your system (find with `lerobot-find-cameras`)
 
 CAMERAS="{
-  wrist: { type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30 },
+  wrist: { type: opencv, index_or_path: 1, width: 480, height: 640, fps: 30, rotation: -90 },
   top:   { type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30 }
 }"
 

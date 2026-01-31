@@ -81,10 +81,6 @@ class ACTSmoothConfig(PreTrainedConfig):
             documentation in the policy class).
         latent_dim: The VAE's latent dimension.
         n_vae_encoder_layers: The number of transformer layers to use for the VAE's encoder.
-        temporal_ensemble_coeff: Coefficient for the exponential weighting scheme to apply for temporal
-            ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
-            1 when using this feature, as inference needs to happen at every step to form an ensemble. For
-            more information on how ensembling works, please see `ACTSmoothTemporalEnsembler`.
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
@@ -124,10 +120,6 @@ class ACTSmoothConfig(PreTrainedConfig):
     latent_dim: int = 32
     n_vae_encoder_layers: int = 4
 
-    # Inference.
-    # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
-    temporal_ensemble_coeff: float | None = None
-
     # Training and loss computation.
     dropout: float = 0.1
     kl_weight: float = 10.0
@@ -143,11 +135,6 @@ class ACTSmoothConfig(PreTrainedConfig):
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}.")
-        if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
-            raise NotImplementedError(
-                "`n_action_steps` must be 1 when using temporal ensembling. This is "
-                "because the policy needs to be queried every step to compute the ensembled action."
-            )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

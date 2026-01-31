@@ -64,9 +64,6 @@ class ACTSmoothPolicy(PreTrainedPolicy):
 
         self.model = ACTSmooth(config)
 
-        if config.temporal_ensemble_coeff is not None:
-            self.temporal_ensembler = ACTSmoothTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
-
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -84,10 +81,7 @@ class ACTSmoothPolicy(PreTrainedPolicy):
 
     def reset(self):
         """This should be called whenever the environment is reset."""
-        if self.config.temporal_ensemble_coeff is not None:
-            self.temporal_ensembler.reset()
-        else:
-            self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -98,11 +92,6 @@ class ACTSmoothPolicy(PreTrainedPolicy):
         queue is empty.
         """
         self.eval()
-
-        if self.config.temporal_ensemble_coeff is not None:
-            actions = self.predict_action_chunk(batch)
-            action = self.temporal_ensembler.update(actions)
-            return action
 
         if len(self._action_queue) == 0:
             actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
@@ -142,48 +131,6 @@ class ACTSmoothPolicy(PreTrainedPolicy):
             loss = l1_loss
 
         return loss, loss_dict
-
-
-class ACTSmoothTemporalEnsembler:
-    def __init__(self, temporal_ensemble_coeff: float, chunk_size: int) -> None:
-        """Temporal ensembling as described in Algorithm 2 of https://huggingface.co/papers/2304.13705."""
-        self.chunk_size = chunk_size
-        self.ensemble_weights = torch.exp(-temporal_ensemble_coeff * torch.arange(chunk_size))
-        self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0)
-        self.reset()
-
-    def reset(self):
-        """Resets the online computation variables."""
-        self.ensembled_actions = None
-        self.ensembled_actions_count = None
-
-    def update(self, actions: Tensor) -> Tensor:
-        """
-        Takes a (batch, chunk_size, action_dim) sequence of actions, update the temporal ensemble for all
-        time steps, and pop/return the next batch of actions in the sequence.
-        """
-        self.ensemble_weights = self.ensemble_weights.to(device=actions.device)
-        self.ensemble_weights_cumsum = self.ensemble_weights_cumsum.to(device=actions.device)
-        if self.ensembled_actions is None:
-            self.ensembled_actions = actions.clone()
-            self.ensembled_actions_count = torch.ones(
-                (self.chunk_size, 1), dtype=torch.long, device=self.ensembled_actions.device
-            )
-        else:
-            self.ensembled_actions *= self.ensemble_weights_cumsum[self.ensembled_actions_count - 1]
-            self.ensembled_actions += actions[:, :-1] * self.ensemble_weights[self.ensembled_actions_count]
-            self.ensembled_actions /= self.ensemble_weights_cumsum[self.ensembled_actions_count]
-            self.ensembled_actions_count = torch.clamp(self.ensembled_actions_count + 1, max=self.chunk_size)
-            self.ensembled_actions = torch.cat([self.ensembled_actions, actions[:, -1:]], dim=1)
-            self.ensembled_actions_count = torch.cat(
-                [self.ensembled_actions_count, torch.ones_like(self.ensembled_actions_count[-1:])]
-            )
-        action, self.ensembled_actions, self.ensembled_actions_count = (
-            self.ensembled_actions[:, 0],
-            self.ensembled_actions[:, 1:],
-            self.ensembled_actions_count[1:],
-        )
-        return action
 
 
 class ACTSmooth(nn.Module):

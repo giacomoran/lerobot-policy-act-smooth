@@ -91,6 +91,16 @@ class ACTSmoothConfig(PreTrainedConfig):
     chunk_size: int = 100
     n_action_steps: int = 100
 
+    # Delay conditioning.
+    # The model learns to predict action chunks given a prefix of already-executed actions.
+    # This enables smoother real-time inference: instead of waiting for a full chunk to complete,
+    # the policy can "continue" from partially-executed chunks.
+    # - delay (d): Number of actions from current chunk already executed (0 to max_delay inclusive)
+    # - action_prefix: The first d actions of the chunk, already executed
+    # At delay=d: given d actions as context, predict actions[d:d+chunk_size]
+    # Note: max_delay must be >= 1. For no delay conditioning, use vanilla ACT instead.
+    max_delay: int = 1
+
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
@@ -142,6 +152,11 @@ class ACTSmoothConfig(PreTrainedConfig):
             )
         if self.n_obs_steps != 1:
             raise ValueError(f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`")
+        if self.max_delay < 1:
+            raise ValueError(
+                f"max_delay must be >= 1. Got {self.max_delay}. "
+                "For max_delay=0 (no delay conditioning), use vanilla ACT instead."
+            )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -162,7 +177,10 @@ class ACTSmoothConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        return list(range(self.chunk_size))
+        # Load extended sequence: prefix candidates + targets for all delays.
+        # For delay d, prefix = actions[0:d], targets = actions[d:d+chunk_size]
+        # Max needed: actions[0:chunk_size+max_delay]
+        return list(range(self.chunk_size + self.max_delay))
 
     @property
     def reward_delta_indices(self) -> None:

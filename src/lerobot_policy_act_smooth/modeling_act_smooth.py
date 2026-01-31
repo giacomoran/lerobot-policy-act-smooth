@@ -17,6 +17,33 @@
 
 Based on Action Chunking Transformer from Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware
 (https://huggingface.co/papers/2304.13705).
+
+Adds delay conditioning for smoother real-time inference: instead of waiting for a full chunk to complete,
+the policy can "continue" from partially-executed chunks by conditioning on an action prefix.
+
+Note on delay semantics
+-----------------------
+At inference time, the action prefix may represent actions from the *previous* chunk that have been
+committed to execution but are not yet executed due to inference/execution latency. These actions are
+"future" relative to the current observation but are guaranteed to be executed, so conditioning on them
+keeps the output chunk consistent with the queued prefix and yields smoother control.
+
+Training vs Inference
+---------------------
+The model handles delays differently in training vs inference:
+
+**Training:**
+- Evaluates ALL delay values {0, 1, ..., max_delay} for each sample in parallel
+- Input batch has B samples, internally expanded to B*(max_delay+1) virtual samples
+- `delays` tensor has shape [B*(max_delay+1)] containing [0,1,...,max_delay, 0,1,...,max_delay, ...]
+- `batch[ACTION]` has shape [B, max_delay + chunk_size, action_dim] (full action sequence)
+- Loss is computed across all delays
+
+**Inference:**
+- Evaluates ONE delay value (you know exactly how many actions were already executed)
+- `delays` tensor has shape [B] containing [delay, delay, ...] (same value repeated)
+- `batch[ACTION]` has shape [B, max_delay, action_dim] (action prefix only)
+- Returns action chunk predictions for the specified delay
 """
 
 import math
@@ -29,20 +56,24 @@ import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
+from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
-from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
-
 from .configuration_act_smooth import ACTSmoothConfig
+
+# Batch key for delay values. Shape differs between training and inference (see module docstring).
+DELAYS = "delays"
 
 
 class ACTSmoothPolicy(PreTrainedPolicy):
     """
     ACTSmooth Policy based on Action Chunking Transformer
     (paper: https://huggingface.co/papers/2304.13705, code: https://github.com/tonyzhaozh/act)
+
+    Adds delay conditioning for smoother real-time inference.
     """
 
     config_class = ACTSmoothConfig
@@ -63,6 +94,12 @@ class ACTSmoothPolicy(PreTrainedPolicy):
         self.config = config
 
         self.model = ACTSmooth(config)
+
+        # Precompute target indices for training loss computation
+        # _indices_target[d, t] = d + t gives the action index for delay d at timestep t
+        indices_delay = torch.arange(config.max_delay + 1, dtype=torch.long)
+        indices_offset = torch.arange(config.chunk_size, dtype=torch.long)
+        self.register_buffer("_indices_target", indices_delay.unsqueeze(1) + indices_offset.unsqueeze(0))
 
         self.reset()
 
@@ -90,6 +127,9 @@ class ACTSmoothPolicy(PreTrainedPolicy):
         This method wraps `select_actions` in order to return one action at a time for execution in the
         environment. It works by managing the actions in a queue and only calling `select_actions` when the
         queue is empty.
+
+        Note: This method does not support delay conditioning. For delay-conditioned inference,
+        use predict_action_chunk directly with delay and action_prefix.
         """
         self.eval()
 
@@ -99,28 +139,116 @@ class ACTSmoothPolicy(PreTrainedPolicy):
         return self._action_queue.popleft()
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
+    def predict_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+        action_prefix: Tensor | None = None,
+    ) -> Tensor:
+        """Predict a chunk of actions given environment observations.
+
+        Args:
+            batch: Dictionary of observation tensors.
+        action_prefix: Tensor of shape (batch_size, delay, action_dim) containing
+            the committed-but-not-yet-executed actions from the previous chunk. The delay is inferred
+            from the tensor size. Pass None for delay=0 (no prefix).
+
+        Returns:
+            Tensor of shape (batch_size, chunk_size, action_dim) containing predicted actions.
+        """
         self.eval()
+
+        delay = 0 if action_prefix is None else action_prefix.shape[1]
+        if delay > self.config.max_delay:
+            raise ValueError(f"delay ({delay}) cannot exceed max_delay ({self.config.max_delay}).")
 
         if self.config.image_features:
             batch = dict(batch)
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+
+        # Get batch size and device
+        if OBS_IMAGES in batch:
+            batch_size = batch[OBS_IMAGES][0].shape[0]
+            device = batch[OBS_IMAGES][0].device
+        else:
+            batch_size = batch[OBS_ENV_STATE].shape[0]
+            device = batch[OBS_ENV_STATE].device
+
+        max_delay = self.config.max_delay
+        action_dim = self.config.action_feature.shape[0]
+
+        # Build padded action prefix.
+        # WARNING: Positions [delay:] are zero-padded here, but zeros are valid action values.
+        # The model relies on batch[DELAYS] to mask these positions with action_prefix_pad_embed in ACTSmooth.forward.
+        # If DELAYS is set incorrectly, zeros will be interpreted as real actions.
+        if action_prefix is not None and delay > 0:
+            action_prefix_padded = torch.zeros(
+                (batch_size, max_delay, action_dim),
+                dtype=action_prefix.dtype,
+                device=action_prefix.device,
+            )
+            action_prefix_padded[:, :delay] = action_prefix
+        else:
+            action_prefix_padded = torch.zeros(
+                (batch_size, max_delay, action_dim),
+                dtype=torch.float32,
+                device=device,
+            )
+
+        delays = torch.full((batch_size,), delay, dtype=torch.long, device=device)
+
+        batch[ACTION] = action_prefix_padded
+        batch[DELAYS] = delays
 
         actions = self.model(batch)[0]
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        """Run the batch through the model and compute the loss for training or validation."""
+        """Run the batch through the model and compute the loss for training.
+
+        See module docstring for training vs inference differences.
+
+        Expected batch keys:
+        - OBS_STATE or OBS_ENV_STATE: observation state
+        - ACTION: [B, max_delay + chunk_size, action_dim]
+        - action_is_pad: [B, max_delay + chunk_size] padding mask
+        """
+        max_delay = self.config.max_delay
+        chunk_size = self.config.chunk_size
+
         if self.config.image_features:
             batch = dict(batch)
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
+        # Get batch size
+        if OBS_IMAGES in batch:
+            batch_size = batch[OBS_IMAGES][0].shape[0]
+        else:
+            batch_size = batch[OBS_ENV_STATE].shape[0]
+
+        # batch[ACTION]: [B, max_delay + chunk_size, action_dim]
+        expected_action_len = max_delay + chunk_size
+        actual_action_len = batch[ACTION].shape[1]
+        assert actual_action_len == expected_action_len, (
+            f"batch[ACTION].shape[1]={actual_action_len} must equal "
+            f"max_delay + chunk_size = {max_delay} + {chunk_size} = {expected_action_len}. "
+            f"Check that action_delta_indices matches: {self.config.action_delta_indices}"
+        )
+
+        # Inner model returns [B*(max_delay+1), chunk_size, action_dim] during training
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        l1_loss = (
-            F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
-        ).mean()
+        # Reshape predictions: [B*(max_delay+1), chunk_size, action_dim] -> [B, max_delay+1, chunk_size, action_dim]
+        actions_hat = actions_hat.reshape(batch_size, max_delay + 1, chunk_size, -1)
+
+        # Extract targets for each delay: targets[b, d] = actions[b, d:d+chunk_size]
+        # Uses precomputed _indices_target[d, t] = d + t for efficient indexing
+        targets = batch[ACTION][:, self._indices_target]  # [B, D, chunk_size, action_dim]
+
+        # Extract padding mask for each delay
+        action_is_pad = batch["action_is_pad"][:, self._indices_target]  # [B, D, chunk_size]
+
+        # Compute L1 loss with padding mask
+        l1_loss = (F.l1_loss(targets, actions_hat, reduction="none") * ~action_is_pad.unsqueeze(-1)).mean()
 
         loss_dict = {"l1_loss": l1_loss.item()}
         if self.config.use_vae:
@@ -134,7 +262,11 @@ class ACTSmoothPolicy(PreTrainedPolicy):
 
 
 class ACTSmooth(nn.Module):
-    """ACTSmooth: The underlying neural network for ACTSmoothPolicy."""
+    """ACTSmooth: The underlying neural network for ACTSmoothPolicy.
+
+    Always uses delay conditioning (max_delay >= 1). For vanilla ACT without delay conditioning,
+    use the standard ACT policy instead.
+    """
 
     def __init__(self, config: ACTSmoothConfig):
         super().__init__()
@@ -178,17 +310,20 @@ class ACTSmooth(nn.Module):
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(backbone_model.fc.in_features, config.dim_model, kernel_size=1)
+        self.encoder_action_prefix_input_proj = nn.Linear(self.config.action_feature.shape[0], config.dim_model)
         n_1d_tokens = 1
         if self.config.robot_state_feature:
             n_1d_tokens += 1
         if self.config.env_state_feature:
             n_1d_tokens += 1
+        n_1d_tokens += config.max_delay
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
             self.encoder_cam_feat_pos_embed = ACTSmoothSinusoidalPositionEmbedding2d(config.dim_model // 2)
 
         self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
         self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
+        self.action_prefix_pad_embed = nn.Parameter(torch.zeros(config.dim_model))
 
         self._reset_parameters()
 
@@ -199,18 +334,39 @@ class ACTSmooth(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
-        """A forward pass through the ACTSmooth model (with optional VAE encoder)."""
-        if self.config.use_vae and self.training:
-            assert ACTION in batch, "actions must be provided when using the variational objective in training mode."
+        """Forward pass through ACTSmooth with delay conditioning.
+
+        See module docstring for training vs inference differences.
+
+        The model distinguishes training vs inference by batch[ACTION] sequence length:
+        - Training: max_delay + chunk_size (full sequence, delays generated internally)
+        - Inference: max_delay (prefix only, delays from batch[DELAYS])
+        """
+        max_delay = self.config.max_delay
+
+        actions = batch.get(ACTION)
+        delays = batch.get(DELAYS)
+
+        if actions is not None:
+            action_seq_len = actions.shape[1]
+            is_training_batch = action_seq_len == max_delay + self.config.chunk_size
+        else:
+            is_training_batch = False
+            action_seq_len = 0
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        device = batch[OBS_IMAGES][0].device if OBS_IMAGES in batch else batch[OBS_ENV_STATE].device
 
-        if self.config.use_vae and ACTION in batch and self.training:
+        # VAE encoder (training only) - runs on original batch_size before expansion
+        if self.config.use_vae and is_training_batch and self.training:
+            action_targets = actions[:, : self.config.chunk_size]
+            action_is_pad_targets = batch["action_is_pad"][:, : self.config.chunk_size]
+
             cls_embed = einops.repeat(self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size)
             if self.config.robot_state_feature:
                 robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
                 robot_state_embed = robot_state_embed.unsqueeze(1)
-            action_embed = self.vae_encoder_action_input_proj(batch[ACTION])
+            action_embed = self.vae_encoder_action_input_proj(action_targets)
 
             if self.config.robot_state_feature:
                 vae_encoder_input = [cls_embed, robot_state_embed, action_embed]
@@ -223,9 +379,9 @@ class ACTSmooth(nn.Module):
             cls_joint_is_pad = torch.full(
                 (batch_size, 2 if self.config.robot_state_feature else 1),
                 False,
-                device=batch[OBS_STATE].device,
+                device=device,
             )
-            key_padding_mask = torch.cat([cls_joint_is_pad, batch["action_is_pad"]], axis=1)
+            key_padding_mask = torch.cat([cls_joint_is_pad, action_is_pad_targets], axis=1)
 
             cls_token_out = self.vae_encoder(
                 vae_encoder_input.permute(1, 0, 2),
@@ -239,17 +395,13 @@ class ACTSmooth(nn.Module):
             latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
         else:
             mu = log_sigma_x2 = None
-            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-                batch[OBS_STATE].device
-            )
+            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(device)
 
-        encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
-        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
-        if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
-        if self.config.env_state_feature:
-            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+        # Build encoder input tokens: images first (sinusoidal 2D pos embed), then 1D features
+        encoder_in_tokens = []
+        encoder_in_pos_embed = []
 
+        # 1. Images first (sinusoidal 2D pos embed)
         if self.config.image_features:
             for img in batch[OBS_IMAGES]:
                 cam_features = self.backbone(img)["feature_map"]
@@ -262,12 +414,105 @@ class ACTSmooth(nn.Module):
                 encoder_in_tokens.extend(list(cam_features))
                 encoder_in_pos_embed.extend(list(cam_pos_embed))
 
-        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
-        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+        # 2. Latent token (learnable pos embed)
+        pos_1d_idx = 0
+        encoder_in_tokens.append(self.encoder_latent_input_proj(latent_sample))
+        encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].unsqueeze(0))
+        pos_1d_idx += 1
+
+        # 3. Env state (if present)
+        if self.config.env_state_feature:
+            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+            encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].unsqueeze(0))
+            pos_1d_idx += 1
+
+        # 4. Robot state (if present)
+        if self.config.robot_state_feature:
+            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].unsqueeze(0))
+            pos_1d_idx += 1
+
+        # Stack tokens (before training expansion)
+        encoder_in_tokens = torch.stack(encoder_in_tokens, dim=0)  # [n_tokens, B, dim]
+        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, dim=0)  # [n_tokens, 1, dim]
+
+        # Training: expand batch to evaluate all delays in parallel (see module docstring).
+        # Expansion happens AFTER backbone (expensive CNN runs once per sample, not per delay).
+        if is_training_batch and self.training:
+            n_tokens = encoder_in_tokens.shape[0]
+
+            # Expand encoder tokens: [n_tokens, B, dim] -> [n_tokens, B*(max_delay+1), dim]
+            encoder_in_tokens = encoder_in_tokens.unsqueeze(2).expand(-1, -1, max_delay + 1, -1)
+            encoder_in_tokens = encoder_in_tokens.reshape(n_tokens, batch_size * (max_delay + 1), -1)
+
+            # Expand pos_embed: [n_tokens, 1, dim] -> [n_tokens, B*(max_delay+1), dim]
+            encoder_in_pos_embed = encoder_in_pos_embed.expand(-1, batch_size * (max_delay + 1), -1)
+
+            # Create delays for all delay values: [max_delay+1] -> [B*(max_delay+1)]
+            delays = torch.arange(max_delay + 1, dtype=torch.long, device=device)
+            delays = delays.unsqueeze(0).expand(batch_size, -1).reshape(-1)
+
+            # Expand actions: [B, seq_len, action_dim] -> [B*(max_delay+1), seq_len, action_dim]
+            actions = (
+                actions.unsqueeze(1)
+                .expand(-1, max_delay + 1, -1, -1)
+                .reshape(batch_size * (max_delay + 1), -1, actions.shape[-1])
+            )
+
+            batch_size_effective = batch_size * (max_delay + 1)
+        else:
+            batch_size_effective = batch_size
+            # Expand pos_embed to match batch size for inference
+            encoder_in_pos_embed = encoder_in_pos_embed.expand(-1, batch_size_effective, -1)
+            # Default to delay=0 if not provided
+            if delays is None:
+                delays = torch.zeros(batch_size_effective, dtype=torch.long, device=device)
+
+        # 5. Action prefix (learnable pos embed, after expansion)
+        action_prefix = (
+            actions[:, :max_delay]
+            if actions is not None
+            else torch.zeros(batch_size_effective, max_delay, self.config.action_feature.shape[0], device=device)
+        )
+
+        # Project all positions, then mask invalid ones (simpler than variable-length handling)
+        action_prefix_embed = self.encoder_action_prefix_input_proj(action_prefix)
+
+        # Replace positions >= delay or padded positions with learnable action_prefix_pad_embed
+        if "action_is_pad" in batch:
+            prefix_pad = batch["action_is_pad"][:, :max_delay]
+            if is_training_batch and self.training:
+                prefix_pad = (
+                    prefix_pad.unsqueeze(1)
+                    .expand(-1, max_delay + 1, -1)
+                    .reshape(batch_size_effective, max_delay)
+                )
+            prefix_pad = prefix_pad.to(device=device)
+        else:
+            prefix_pad = torch.zeros(
+                (batch_size_effective, max_delay),
+                dtype=torch.bool,
+                device=device,
+            )
+
+        mask = (torch.arange(max_delay, device=device)[None, :] >= delays[:, None]) | prefix_pad
+        action_prefix_embed = torch.where(
+            mask.unsqueeze(-1),
+            self.action_prefix_pad_embed[None, None, :].expand_as(action_prefix_embed),
+            action_prefix_embed,
+        )
+
+        prefix_tokens = action_prefix_embed.permute(1, 0, 2)  # [max_delay, B_eff, dim]
+        encoder_in_tokens = torch.cat([encoder_in_tokens, prefix_tokens], dim=0)
+
+        # Use learnable positional embeddings for action prefix
+        prefix_pos_embed = self.encoder_1d_feature_pos_embed.weight[pos_1d_idx : pos_1d_idx + max_delay]
+        prefix_pos_embed = prefix_pos_embed.unsqueeze(1).expand(-1, batch_size_effective, -1)
+        encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, prefix_pos_embed], dim=0)
 
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
         decoder_in = torch.zeros(
-            (self.config.chunk_size, batch_size, self.config.dim_model),
+            (self.config.chunk_size, batch_size_effective, self.config.dim_model),
             dtype=encoder_in_pos_embed.dtype,
             device=encoder_in_pos_embed.device,
         )
@@ -279,10 +524,9 @@ class ACTSmooth(nn.Module):
         )
 
         decoder_out = decoder_out.transpose(0, 1)
+        actions_out = self.action_head(decoder_out)
 
-        actions = self.action_head(decoder_out)
-
-        return actions, (mu, log_sigma_x2)
+        return actions_out, (mu, log_sigma_x2)
 
 
 class ACTSmoothEncoder(nn.Module):

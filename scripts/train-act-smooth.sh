@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Train vanilla ACT policy on the lerobot_policy_act_smooth datasets.
+# Train ACTSmooth policy on the lerobot_policy_act_smooth datasets.
 #
 # Datasets:
 #   - giacomoran/lerobot_policy_act_smooth_10fps
@@ -14,10 +14,10 @@ DIR_BASE="/workspace"
 echo "=== Training on lerobot_policy_act_smooth_10fps ==="
 
 lerobot-train \
-    --policy.type=act \
+    --policy.type=act_smooth \
     --dataset.repo_id=giacomoran/lerobot_policy_act_smooth_10fps \
-    --policy.repo_id=giacomoran/lerobot_policy_act_smooth_10fps_vanilla \
-    --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_10fps_vanilla" \
+    --policy.repo_id=giacomoran/lerobot_policy_act_smooth_10fps_smooth_d2 \
+    --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_d2" \
     --policy.input_features='{"observation.state": {"shape": [6], "type": "STATE"}, "observation.images.wrist": {"shape": [3, 640, 480], "type": "VISUAL"}, "observation.images.top": {"shape": [3, 480, 640], "type": "VISUAL"}}' \
     --steps=30000 \
     --save_freq=10000 \
@@ -27,6 +27,7 @@ lerobot-train \
     --policy.chunk_size=10 \
     --policy.n_action_steps=10 \
     --policy.use_vae=false \
+    --policy.max_delay=2 \
     --policy.device=cuda \
     --wandb.enable=true \
     --wandb.disable_artifact=true \
@@ -37,8 +38,8 @@ echo "=== Resuming 10fps to add extra checkpoints ==="
 
 lerobot-train \
     --resume=true \
-    --config_path="${DIR_BASE}/lerobot_policy_act_smooth_10fps_vanilla/checkpoints/030000/pretrained_model/train_config.json" \
-    --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_10fps_vanilla" \
+    --config_path="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_d2/checkpoints/030000/pretrained_model/train_config.json" \
+    --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_d2" \
     --steps=30003 \
     --save_freq=1
 
@@ -46,10 +47,10 @@ lerobot-train \
 echo "=== Training on lerobot_policy_act_smooth_30fps ==="
 
 lerobot-train \
-    --policy.type=act \
+    --policy.type=act_smooth \
     --dataset.repo_id=giacomoran/lerobot_policy_act_smooth_30fps \
-    --policy.repo_id=giacomoran/lerobot_policy_act_smooth_30fps_vanilla \
-    --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_30fps_vanilla" \
+    --policy.repo_id=giacomoran/lerobot_policy_act_smooth_30fps_smooth_d2 \
+    --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_30fps_smooth_d2" \
     --policy.input_features='{"observation.state": {"shape": [6], "type": "STATE"}, "observation.images.wrist": {"shape": [3, 640, 480], "type": "VISUAL"}, "observation.images.top": {"shape": [3, 480, 640], "type": "VISUAL"}}' \
     --steps=30000 \
     --save_freq=10000 \
@@ -59,6 +60,7 @@ lerobot-train \
     --policy.chunk_size=30 \
     --policy.n_action_steps=30 \
     --policy.use_vae=false \
+    --policy.max_delay=2 \
     --policy.device=cuda \
     --wandb.enable=true \
     --wandb.disable_artifact=true \
@@ -69,8 +71,8 @@ echo "=== Resuming 30fps to add extra checkpoints ==="
 
 lerobot-train \
     --resume=true \
-    --config_path="${DIR_BASE}/lerobot_policy_act_smooth_30fps_vanilla/checkpoints/030000/pretrained_model/train_config.json" \
-    --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_30fps_vanilla" \
+    --config_path="${DIR_BASE}/lerobot_policy_act_smooth_30fps_smooth_d2/checkpoints/030000/pretrained_model/train_config.json" \
+    --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_30fps_smooth_d2" \
     --steps=30003 \
     --save_freq=1
 
@@ -83,7 +85,7 @@ echo "=== Training complete ==="
 echo "=== Compressing outputs ==="
 cd "${DIR_BASE}"
 
-DIRS_OUTPUT="lerobot_policy_act_smooth_10fps_vanilla lerobot_policy_act_smooth_30fps_vanilla"
+DIRS_OUTPUT="lerobot_policy_act_smooth_10fps_smooth_d2 lerobot_policy_act_smooth_30fps_smooth_d2"
 ARGS_TAR=""
 
 for DIR in ${DIRS_OUTPUT}; do
@@ -103,14 +105,14 @@ for DIR in ${DIRS_OUTPUT}; do
 done
 
 if [ -n "${ARGS_TAR}" ]; then
-    tar -czvf lerobot_policy_act_smooth_vanilla.tar.gz ${ARGS_TAR}
-    echo "Done! Archive: ${DIR_BASE}/lerobot_policy_act_smooth_vanilla.tar.gz"
+    tar -czvf lerobot_policy_act_smooth_smooth_d2.tar.gz ${ARGS_TAR}
+    echo "Done! Archive: ${DIR_BASE}/lerobot_policy_act_smooth_smooth_d2.tar.gz"
 else
     echo "ERROR: No checkpoints found to compress!"
     exit 1
 fi
 
 # To transfer and uncompress on local machine:
-#   Remote:  croc send lerobot_policy_act_smooth_vanilla.tar.gz
+#   Remote:  croc send lerobot_policy_act_smooth_smooth_d2.tar.gz
 #   Local:   croc <code>
-#            tar -xzvf lerobot_policy_act_smooth_vanilla.tar.gz -C /path/to/destination
+#            tar -xzvf lerobot_policy_act_smooth_smooth_d2.tar.gz -C /path/to/destination

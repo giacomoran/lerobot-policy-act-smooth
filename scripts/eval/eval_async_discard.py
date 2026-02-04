@@ -252,8 +252,11 @@ def thread_actor_fn(
                     action_next = None
                     if action_chunk_current is not None:
                         action_next = action_chunk_current.action_at(timestep_next)
-                    if action_next is None and state.action_chunk_pending is not None:
-                        action_next = state.action_chunk_pending.action_at(timestep_next)
+                    # If pending chunk has action at next timestep, we'll switch to it, so use its action
+                    if state.action_chunk_pending is not None:
+                        action_next_pending = state.action_chunk_pending.action_at(timestep_next)
+                        if action_next_pending is not None:
+                            action_next = action_next_pending
 
                     if action_next is not None:
                         action_interp_end = postprocessor(action_next.unsqueeze(0)).squeeze(0).cpu()
@@ -271,7 +274,7 @@ def thread_actor_fn(
                 # Interpolation on non-control frames
                 if is_interpolation_ready and action_interp_start is not None:
                     idx_within_period = idx_frame % num_frames_per_control_frame
-                    t = idx_within_period / (num_frames_per_control_frame - 1)
+                    t = idx_within_period / num_frames_per_control_frame
 
                     action_interp = (1.0 - t) * action_interp_start + t * action_interp_end
                     robot_action_interp = {name: float(action_interp[i]) for i, name in enumerate(action_names)}

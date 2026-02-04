@@ -19,7 +19,7 @@ VARIANT_POLICY=""
 FPS_POLICY=""
 CHECKPOINT="030003"
 MAX_DELAY="2"
-FPS_COMMAND=30
+FPS_OBSERVATION=30
 EPISODE_TIME_S=60
 DISPLAY_DATA=true
 
@@ -76,7 +76,8 @@ case "$VARIANT_EVAL" in
         --robot.id=arm_follower_0 \
         --robot.cameras="$CAMERAS" \
         --policy.path="$PATH_POLICY" \
-        --fps="$FPS_POLICY" \
+        --fps_policy="$FPS_POLICY" \
+        --fps_observation="$FPS_OBSERVATION" \
         --episode_time_s="$EPISODE_TIME_S" \
         --display_data="$DISPLAY_DATA"
     ;;
@@ -88,7 +89,8 @@ case "$VARIANT_EVAL" in
         --robot.id=arm_follower_0 \
         --robot.cameras="$CAMERAS" \
         --policy.path="$PATH_POLICY" \
-        --fps="$FPS_POLICY" \
+        --fps_policy="$FPS_POLICY" \
+        --fps_observation="$FPS_OBSERVATION" \
         --episode_time_s="$EPISODE_TIME_S" \
         --display_data="$DISPLAY_DATA"
     ;;
@@ -101,7 +103,7 @@ case "$VARIANT_EVAL" in
         --robot.cameras="$CAMERAS" \
         --policy.path="$PATH_POLICY" \
         --fps_policy="$FPS_POLICY" \
-        --fps_command="$FPS_COMMAND" \
+        --fps_observation="$FPS_OBSERVATION" \
         --threshold_remaining_actions="$THRESHOLD_REMAINING_ACTIONS" \
         --episode_time_s="$EPISODE_TIME_S" \
         --display_data="$DISPLAY_DATA"
@@ -115,7 +117,7 @@ case "$VARIANT_EVAL" in
         --robot.cameras="$CAMERAS" \
         --policy.path="$PATH_POLICY" \
         --fps_policy="$FPS_POLICY" \
-        --fps_command="$FPS_COMMAND" \
+        --fps_observation="$FPS_OBSERVATION" \
         --threshold_remaining_actions="$THRESHOLD_REMAINING_ACTIONS" \
         --episode_time_s="$EPISODE_TIME_S" \
         --display_data="$DISPLAY_DATA"

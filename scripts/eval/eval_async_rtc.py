@@ -9,7 +9,7 @@ transitions without discontinuities.
 **ACTSmooth only** - requires max_delay >= 1.
 
 Architecture:
-- Actor thread: runs at fps_command, switches to new chunks when available, passes action prefix
+- Actor thread: runs at fps_observation, switches to new chunks when available, passes action prefix
 - Inference thread: triggered by actor, runs inference with action prefix
 - Shared state: current observation, pending chunk, inference status, RTC prefix data
 
@@ -21,7 +21,7 @@ Usage:
         --robot.id=arm_follower_0 \
         --policy.path=outputs/model/pretrained_model \
         --fps_policy=10 \
-        --fps_command=30 \
+        --fps_observation=30 \
         --display_data=true
 """
 
@@ -70,7 +70,7 @@ class EvalAsyncRTCConfig:
 
     # Control parameters
     fps_policy: int = 10
-    fps_command: int = 30
+    fps_observation: int = 30
     episode_time_s: float = 60.0
 
     # Override n_action_steps from policy config (None = use policy default)
@@ -93,10 +93,12 @@ class EvalAsyncRTCConfig:
         if self.policy is None:
             raise ValueError("A policy must be provided via --policy.path=...")
 
-        if self.fps_command % self.fps_policy != 0:
-            raise ValueError(f"fps_command ({self.fps_command}) must be a multiple of fps_policy ({self.fps_policy})")
-        if self.fps_command < self.fps_policy:
-            raise ValueError(f"fps_command ({self.fps_command}) must be >= fps_policy ({self.fps_policy})")
+        if self.fps_observation % self.fps_policy != 0:
+            raise ValueError(
+                f"fps_observation ({self.fps_observation}) must be a multiple of fps_policy ({self.fps_policy})"
+            )
+        if self.fps_observation < self.fps_policy:
+            raise ValueError(f"fps_observation ({self.fps_observation}) must be >= fps_policy ({self.fps_policy})")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -114,13 +116,12 @@ class ActionChunk:
 
     The policy produces a chunk of actions from an observation and an action
     prefix. The predicted action chunk corresponds to timesteps:
-    `[timestep_obs + 1 + delay, timestep_obs + 1 + delay + chunk_size)`.
-    The `+ 1` is there because action[timestep_obs] is skipped (proprioception).
+    `[timestep_obs + delay, timestep_obs + delay + chunk_size)`.
 
     Attributes:
         actions: Action tensor [n_actions, action_dim] as ABSOLUTE joint positions
         timestep_obs: Reference execution timestep for action indexing
-        delay: Number of prefix steps used; actions[0] executes at timestep_obs + delay + 1
+        delay: Number of prefix steps used; actions[0] executes at timestep_obs + delay
         idx_chunk: Inference counter that generated this chunk (for logging)
     """
 
@@ -131,7 +132,7 @@ class ActionChunk:
 
     def action_at(self, timestep: int) -> torch.Tensor | None:
         """Get action for the given timestep."""
-        timestep_first_action = self.timestep_obs + self.delay + 1
+        timestep_first_action = self.timestep_obs + self.delay
         idx = timestep - timestep_first_action
         if 0 <= idx < len(self.actions):
             return self.actions[idx]
@@ -139,7 +140,7 @@ class ActionChunk:
 
     def count_remaining_actions_from(self, timestep: int) -> int:
         """Get number of actions remaining after the given timestep."""
-        timestep_first_action = self.timestep_obs + self.delay + 1
+        timestep_first_action = self.timestep_obs + self.delay
         idx = timestep + 1 - timestep_first_action
         return max(0, len(self.actions) - idx)
 
@@ -148,7 +149,7 @@ class ActionChunk:
 
         Args:
             timestep: Current timestep (new observation time). Prefix will contain
-                actions at timesteps [timestep + 1, timestep + delay].
+                actions at timesteps [timestep, timestep + delay - 1].
             length_max: Maximum prefix length (e.g., max_delay)
 
         Returns:
@@ -156,12 +157,15 @@ class ActionChunk:
             - action_prefix: Tensor [1, delay, action_dim] or None if delay=0
             - delay: Actual prefix length used
         """
-        count_remaining = self.count_remaining_actions_from(timestep)
-        delay = min(length_max, count_remaining)
+        timestep_first_action = self.timestep_obs + self.delay
+        idx_start = timestep - timestep_first_action
+        if idx_start < 0:
+            return None, 0
+
+        count_remaining_including_current = len(self.actions) - idx_start
+        delay = min(length_max, count_remaining_including_current)
 
         if delay > 0:
-            timestep_first_action = self.timestep_obs + self.delay + 1
-            idx_start = timestep + 1 - timestep_first_action
             action_prefix = self.actions[idx_start : idx_start + delay]
             action_prefix = action_prefix.unsqueeze(0)
             return action_prefix, delay
@@ -212,12 +216,12 @@ def thread_actor_fn(
     tracker_discard: DiscardTracker,
 ) -> None:
     """Actor thread: executes actions from current chunk at target fps."""
-    fps_target = cfg.fps_command
+    fps_target = cfg.fps_observation
     duration_s_frame_target = 1.0 / fps_target
     count_executed_actions = 0
     action_chunk_active: ActionChunk | None = None
 
-    num_frames_per_control_frame = cfg.fps_command // cfg.fps_policy
+    num_frames_per_control_frame = cfg.fps_observation // cfg.fps_policy
 
     robot_action_last_executed = None
     action_interp_start: torch.Tensor | None = None
@@ -243,8 +247,8 @@ def thread_actor_fn(
                         action_chunk_pending = state.action_chunk_pending
                         if action_chunk_pending.action_at(timestep) is not None:
                             # Track discarded actions (old chunk remaining + new chunk skipped)
-                            # For RTC: first action is at timestep_obs + delay + 1
-                            timestep_first_action = action_chunk_pending.timestep_obs + action_chunk_pending.delay + 1
+                            # For RTC: first action is at timestep_obs + delay
+                            timestep_first_action = action_chunk_pending.timestep_obs + action_chunk_pending.delay
                             n_discarded = max(0, timestep - timestep_first_action)
                             if action_chunk_active is not None:
                                 n_discarded += action_chunk_active.count_remaining_actions_from(timestep)
@@ -312,7 +316,7 @@ def thread_actor_fn(
             else:
                 if is_interpolation_ready and action_interp_start is not None:
                     idx_within_period = idx_frame % num_frames_per_control_frame
-                    t = idx_within_period / num_frames_per_control_frame
+                    t = idx_within_period / (num_frames_per_control_frame - 1)
 
                     action_interp = (1.0 - t) * action_interp_start + t * action_interp_end
                     robot_action_interp = {name: float(action_interp[i]) for i, name in enumerate(action_names)}
@@ -431,7 +435,7 @@ def thread_inference_fn(
 
             logging.info(
                 f"[INFERENCE] chunk={idx_chunk} | duration_ms={duration_ms_inference:.1f}ms | "
-                f"timestep={timestep} | delay={delay} | timestep_action_start={timestep + delay + 1}"
+                f"timestep={timestep} | delay={delay} | timestep_action_start={timestep + delay}"
             )
 
     except Exception as e:
@@ -505,7 +509,7 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
 
         logging.info(
             f"Starting episode (max {cfg.episode_time_s}s at {cfg.fps_policy} fps policy, "
-            f"{cfg.fps_command} fps command)"
+            f"{cfg.fps_observation} fps command)"
         )
         logging.info(f"Remaining actions threshold: {cfg.threshold_remaining_actions}")
 

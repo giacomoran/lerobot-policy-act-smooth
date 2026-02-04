@@ -13,7 +13,8 @@ Usage:
         --robot.id=arm_follower_0 \
         --robot.cameras="{wrist: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}}" \
         --policy.path=outputs/model/pretrained_model \
-        --fps=30 \
+        --fps_policy=10 \
+        --fps_observation=30 \
         --episode_time_s=60 \
         --display_data=true
 """
@@ -59,7 +60,8 @@ class EvalSyncConfig:
     policy: PreTrainedConfig | None = None
 
     # Control parameters
-    fps: int = 30
+    fps_policy: int = 10
+    fps_observation: int = 30
     episode_time_s: float = 60.0
 
     # Override n_action_steps from policy config (None = use policy default)
@@ -78,6 +80,13 @@ class EvalSyncConfig:
 
         if self.policy is None:
             raise ValueError("A policy must be provided via --policy.path=...")
+
+        if self.fps_observation % self.fps_policy != 0:
+            raise ValueError(
+                f"fps_observation ({self.fps_observation}) must be a multiple of fps_policy ({self.fps_policy})"
+            )
+        if self.fps_observation < self.fps_policy:
+            raise ValueError(f"fps_observation ({self.fps_observation}) must be >= fps_policy ({self.fps_policy})")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -153,7 +162,10 @@ def run_episode_sync(
     3. Execute all actions at target fps
     4. Repeat until episode ends
     """
-    logging.info(f"Starting episode (max {cfg.episode_time_s}s at {cfg.fps} fps)")
+    logging.info(
+        f"Starting episode (max {cfg.episode_time_s}s at {cfg.fps_policy} fps policy, "
+        f"{cfg.fps_observation} fps observation)"
+    )
     logging.info("Press ESC to terminate episode early")
 
     policy.reset()
@@ -173,7 +185,8 @@ def run_episode_sync(
     n_action_steps = cfg.n_action_steps if cfg.n_action_steps is not None else policy_n_action_steps
     logging.info(f"Using n_action_steps: {n_action_steps}")
 
-    duration_s_frame_target = 1.0 / cfg.fps
+    num_frames_per_control_frame = cfg.fps_observation // cfg.fps_policy
+    duration_s_frame_target = 1.0 / cfg.fps_observation
 
     # === WARMUP INFERENCE ===
     # Run one inference pass to trigger JIT compilation and CUDA kernel loading
@@ -232,8 +245,6 @@ def run_episode_sync(
 
         # === EXECUTION PHASE ===
         for idx_action in range(n_action_steps):
-            ts_start_frame = time.perf_counter()
-
             if events.get("exit_early") or events.get("stop_recording"):
                 break
 
@@ -244,22 +255,28 @@ def run_episode_sync(
             tensor_action = postprocessor(tensor_action)  # Unnormalize
             tensor_action = tensor_action.squeeze(0).cpu()  # (action_dim,)
             robot_action = {name: float(tensor_action[i]) for i, name in enumerate(action_names)}
-            robot.send_action(robot_action)
-            count_total_actions += 1
 
-            if cfg.display_data:
-                dict_obs_vis = robot.get_observation()
-                log_rerun_data(
-                    timestep=count_total_actions,
-                    idx_chunk=idx_chunk,
-                    observation=dict_obs_vis,
-                    action=robot_action,
-                )
+            for idx_frame in range(num_frames_per_control_frame):
+                ts_start_frame = time.perf_counter()
 
-            duration_s_frame = time.perf_counter() - ts_start_frame
-            duration_s_sleep = duration_s_frame_target - duration_s_frame
-            if duration_s_sleep > 0:
-                precise_sleep(duration_s_sleep)
+                is_control_frame = idx_frame == 0
+                if is_control_frame:
+                    robot.send_action(robot_action)
+                    count_total_actions += 1
+
+                if cfg.display_data:
+                    dict_obs_vis = robot.get_observation()
+                    log_rerun_data(
+                        timestep=count_total_actions,
+                        idx_chunk=idx_chunk if is_control_frame else None,
+                        observation=dict_obs_vis,
+                        action=robot_action if is_control_frame else None,
+                    )
+
+                duration_s_frame = time.perf_counter() - ts_start_frame
+                duration_s_sleep = duration_s_frame_target - duration_s_frame
+                if duration_s_sleep > 0:
+                    precise_sleep(duration_s_sleep)
 
         idx_chunk += 1
 

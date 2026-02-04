@@ -8,7 +8,7 @@ available, it switches to it entirely - no merging of leftover actions is needed
 Works with both ACT and ACTSmooth policies (no RTC prefix conditioning).
 
 Architecture:
-- Actor thread: runs at fps_command, switches to new chunks when available
+- Actor thread: runs at fps_observation, switches to new chunks when available
 - Inference thread: triggered by actor when action count drops below threshold
 - Shared state: current observation, pending chunk, inference status
 
@@ -20,7 +20,7 @@ Usage:
         --robot.id=arm_follower_0 \
         --policy.path=outputs/model/pretrained_model \
         --fps_policy=10 \
-        --fps_command=30 \
+        --fps_observation=30 \
         --display_data=true
 """
 
@@ -69,7 +69,7 @@ class EvalAsyncDiscardConfig:
 
     # Control parameters
     fps_policy: int = 10
-    fps_command: int = 30
+    fps_observation: int = 30
     episode_time_s: float = 60.0
 
     # Override n_action_steps from policy config (None = use policy default)
@@ -92,10 +92,12 @@ class EvalAsyncDiscardConfig:
         if self.policy is None:
             raise ValueError("A policy must be provided via --policy.path=...")
 
-        if self.fps_command % self.fps_policy != 0:
-            raise ValueError(f"fps_command ({self.fps_command}) must be a multiple of fps_policy ({self.fps_policy})")
-        if self.fps_command < self.fps_policy:
-            raise ValueError(f"fps_command ({self.fps_command}) must be >= fps_policy ({self.fps_policy})")
+        if self.fps_observation % self.fps_policy != 0:
+            raise ValueError(
+                f"fps_observation ({self.fps_observation}) must be a multiple of fps_policy ({self.fps_policy})"
+            )
+        if self.fps_observation < self.fps_policy:
+            raise ValueError(f"fps_observation ({self.fps_observation}) must be >= fps_policy ({self.fps_policy})")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -175,12 +177,12 @@ def thread_actor_fn(
     tracker_discard: DiscardTracker,
 ) -> None:
     """Actor thread: executes actions from current chunk at target fps."""
-    fps_target = cfg.fps_command
+    fps_target = cfg.fps_observation
     duration_s_frame_target = 1.0 / fps_target
     count_executed_actions = 0
     action_chunk_current: ActionChunk | None = None
 
-    num_frames_per_control_frame = cfg.fps_command // cfg.fps_policy
+    num_frames_per_control_frame = cfg.fps_observation // cfg.fps_policy
 
     robot_action_last_executed = None
     action_interp_start: torch.Tensor | None = None
@@ -269,7 +271,7 @@ def thread_actor_fn(
                 # Interpolation on non-control frames
                 if is_interpolation_ready and action_interp_start is not None:
                     idx_within_period = idx_frame % num_frames_per_control_frame
-                    t = idx_within_period / num_frames_per_control_frame
+                    t = idx_within_period / (num_frames_per_control_frame - 1)
 
                     action_interp = (1.0 - t) * action_interp_start + t * action_interp_end
                     robot_action_interp = {name: float(action_interp[i]) for i, name in enumerate(action_names)}
@@ -443,7 +445,7 @@ def main(cfg: EvalAsyncDiscardConfig) -> None:
 
         logging.info(
             f"Starting episode (max {cfg.episode_time_s}s at {cfg.fps_policy} fps policy, "
-            f"{cfg.fps_command} fps command)"
+            f"{cfg.fps_observation} fps command)"
         )
         logging.info(f"Remaining actions threshold: {cfg.threshold_remaining_actions}")
 

@@ -41,7 +41,8 @@ Follow a noun-first approach for variables and constants, for example `idChat` i
 - Observations: `dict_obs` (raw dict), `proprio_obs` (proprioception), `dict_obs_current`
 - Actions: `action_chunk_pending`, `action_chunk_active`, `tensor_action`
 - Events: `event_shutdown`, `event_inference_requested`
-- Counts: `count_actions`, `count_total_actions` (not `action_count`)
+- Counts: `cnt_actions`, `cnt_total_actions` (not `action_count` or `n_actions`)
+- Lengths: `length_prefix_past`, `length_chunk` (not `n_prefix_past`)
 - Indices: `idx_chunk`, `idx_frame` (not `chunk_idx`)
 - Threads: `thread_inference`, `thread_actor`
 - Paths: `path_recording`, `path_output`

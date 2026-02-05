@@ -13,7 +13,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import os
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
@@ -91,15 +95,28 @@ class ACTSmoothConfig(PreTrainedConfig):
     chunk_size: int = 100
     n_action_steps: int = 100
 
-    # Delay conditioning.
-    # The model learns to predict action chunks given a prefix of already-executed actions.
+    # Action prefix conditioning for smooth chunk transitions.
+    # The model learns to predict action chunks given a prefix of committed actions.
     # This enables smoother real-time inference: instead of waiting for a full chunk to complete,
     # the policy can "continue" from partially-executed chunks.
-    # - delay (d): Number of actions from current chunk already executed (0 to max_delay inclusive)
-    # - action_prefix: The first d actions of the chunk, already executed
-    # At delay=d: given d actions as context, predict actions[d:d+chunk_size]
-    # Note: max_delay must be >= 1. For no delay conditioning, use vanilla ACT instead.
-    max_delay: int = 1
+    #
+    # Prefix = [past completed actions] + [committed pending actions]
+    #          |---- k actions (fixed) ----|  |---- d actions (variable, d >= 1) ---|
+    #
+    # - prefix_length_past (k): Number of past (completed) actions to include in prefix.
+    #   These provide historical context for continuity without adding delay.
+    # - prefix_length_future: Maximum number of committed (pending) actions.
+    #   During training, d is sampled from {1, ..., prefix_length_future}.
+    #   Note: d >= 1 because a_{t_0} is always committed due to inference latency.
+    #
+    # Example at 30fps with k=4, d=2:
+    #   Prefix = [4 past actions, 2 committed] = 6 total (200ms context)
+    #   But delay = only 2 (67ms until new chunk starts)
+    #   Best of both: rich context for continuity + fast reactivity
+    prefix_length_past: int = 0
+    prefix_length_future: int = 1
+    # Deprecated: kept for backward compatibility with older configs/CLI.
+    max_delay: int | None = None
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -143,6 +160,8 @@ class ACTSmoothConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.max_delay is not None and self.prefix_length_future == 1:
+            self.prefix_length_future = self.max_delay
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}.")
         if self.n_action_steps > self.chunk_size:
@@ -152,11 +171,78 @@ class ACTSmoothConfig(PreTrainedConfig):
             )
         if self.n_obs_steps != 1:
             raise ValueError(f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`")
-        if self.max_delay < 1:
+        if self.prefix_length_future < 1:
             raise ValueError(
-                f"max_delay must be >= 1. Got {self.max_delay}. "
-                "For max_delay=0 (no delay conditioning), use vanilla ACT instead."
+                f"prefix_length_future must be >= 1 (t_0 is always committed due to inference latency). "
+                f"Got {self.prefix_length_future}. For no delay conditioning, use vanilla ACT instead."
             )
+        if self.prefix_length_past < 0:
+            raise ValueError(f"prefix_length_past must be >= 0. Got {self.prefix_length_past}.")
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_name_or_path: str | Path,
+        *,
+        force_download: bool = False,
+        resume_download: bool | None = None,
+        proxies: dict | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
+        revision: str | None = None,
+        **policy_kwargs,
+    ):
+        """Load config with backward compatibility for legacy ACTSmooth fields.
+
+        Supports loading older configs that still use `max_delay`.
+        """
+        # Import here to avoid adding hard dependencies at module import time.
+        import draccus
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.constants import CONFIG_NAME
+        from huggingface_hub.errors import HfHubHTTPError
+
+        model_id = str(pretrained_name_or_path)
+        config_file: str | None = None
+        if Path(model_id).is_dir():
+            if CONFIG_NAME in os.listdir(model_id):
+                config_file = os.path.join(model_id, CONFIG_NAME)
+        else:
+            try:
+                config_file = hf_hub_download(
+                    repo_id=model_id,
+                    filename=CONFIG_NAME,
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    proxies=proxies,
+                    resume_download=resume_download,
+                    token=token,
+                    local_files_only=local_files_only,
+                )
+            except HfHubHTTPError as e:
+                raise FileNotFoundError(f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}") from e
+
+        if config_file is None:
+            raise FileNotFoundError(f"{CONFIG_NAME} not found in {Path(model_id).resolve()}")
+
+        with open(config_file) as f:
+            config = json.load(f)
+
+        # Remove legacy/registry fields and map deprecated keys.
+        config.pop("type", None)
+        max_delay = config.pop("max_delay", None)
+        if max_delay is not None and "prefix_length_future" not in config:
+            config["prefix_length_future"] = max_delay
+
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
+            json.dump(config, f)
+            config_file = f.name
+
+        cli_overrides = policy_kwargs.pop("cli_overrides", [])
+        with draccus.config_type("json"):
+            return draccus.parse(cls, config_file, args=cli_overrides)
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -177,10 +263,20 @@ class ACTSmoothConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        # Load extended sequence: prefix candidates + targets for all delays.
-        # For delay d, prefix = actions[0:d], targets = actions[d:d+chunk_size]
-        # Max needed: actions[0:chunk_size+max_delay]
-        return list(range(self.chunk_size + self.max_delay))
+        """Indices for loading action sequences relative to observation timestep.
+
+        batch[ACTION] layout (k = prefix_length_past, D = prefix_length_future, C = chunk_size):
+
+            [t_{-k}, ..., t_{-1}, t_0, t_1, ..., t_{D-1}, t_D, ..., t_{D+C-1}]
+            |------ k past ------|  |---- D committed ----|  |--- C target ---|
+
+        Indices relative to observation (t_0 = index 0): [-k, ..., -1, 0, 1, ..., D + C - 1]
+
+        Note: t_0 is always committed (delay d >= 1), so prediction target starts at t_d.
+        """
+        start = -self.prefix_length_past
+        end = self.prefix_length_future + self.chunk_size
+        return list(range(start, end))
 
     @property
     def reward_delta_indices(self) -> None:

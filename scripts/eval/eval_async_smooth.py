@@ -324,6 +324,7 @@ def step_actor_control_frame(args: ArgsStepActorControlFrame) -> OutputStepActor
             action_next = action_next_from_pending
     # No next action: hold last action as interpolation target (action gap)
     action_interp_target = action_next if action_next is not None else action.clone()
+    should_warn_interpolation_holding_action = action_next is None
 
     return OutputStepActorControlFrame(
         action=action,
@@ -332,7 +333,7 @@ def step_actor_control_frame(args: ArgsStepActorControlFrame) -> OutputStepActor
         cnt_actions_remaining=cnt_actions_remaining,
         cnt_actions_discarded=cnt_actions_discarded,
         should_request_inference=should_request_inference,
-        should_warn_interpolation_holding_action=False,
+        should_warn_interpolation_holding_action=should_warn_interpolation_holding_action,
         action_interp_target=action_interp_target,
     )
 
@@ -420,10 +421,16 @@ def thread_actor_fn(
                     idx_chunk = action_chunk_active.idx_chunk if action_chunk_active else -1
 
                 if should_warn_interpolation_holding_action:
-                    logging.warning(
-                        f"[ACTOR] Action gap at timestep={timestep}: active chunk exhausted, "
-                        f"inference not ready. Holding last action."
-                    )
+                    if action is None:
+                        logging.warning(
+                            f"[ACTOR] Action gap at timestep={timestep}: active chunk exhausted, "
+                            f"inference not ready. Holding last action."
+                        )
+                    else:
+                        logging.warning(
+                            f"[ACTOR] Interpolation holding at timestep={timestep}: "
+                            f"no next action available, using current action as interpolation target."
+                        )
 
                 if action is not None:
                     action = postprocessor(action.unsqueeze(0))  # Unnormalize
@@ -474,9 +481,10 @@ def thread_actor_fn(
             if cfg.display_data:
                 log_rerun_data(
                     timestep=timestep,
+                    idx_frame=idx_frame,
                     idx_chunk=idx_chunk if is_control_frame else None,
                     observation=dict_obs,
-                    action=dict_action_last_executed,
+                    action=dict_action_last_executed if (is_control_frame or is_interpolation_frame) else None,
                 )
 
             cnt_frames_observation += 1

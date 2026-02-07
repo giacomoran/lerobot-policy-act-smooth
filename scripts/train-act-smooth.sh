@@ -23,7 +23,7 @@ lerobot-train \
     --policy.repo_id=giacomoran/lerobot_policy_act_smooth_10fps_smooth_p1f2 \
     --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_p1f2" \
     --policy.input_features='{"observation.state": {"shape": [6], "type": "STATE"}, "observation.images.wrist": {"shape": [3, 640, 480], "type": "VISUAL"}, "observation.images.top": {"shape": [3, 480, 640], "type": "VISUAL"}}' \
-    --steps=30000 \
+    --steps=50000 \
     --save_freq=10000 \
     --batch_size=32 \
     --policy.optimizer_lr=3e-5 \
@@ -43,9 +43,9 @@ echo "=== Resuming 10fps to add extra checkpoints ==="
 
 lerobot-train \
     --resume=true \
-    --config_path="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_p1f2/checkpoints/030000/pretrained_model/train_config.json" \
+    --config_path="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_p1f2/checkpoints/050000/pretrained_model/train_config.json" \
     --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_p1f2" \
-    --steps=30003 \
+    --steps=50003 \
     --save_freq=1
 
 # --- 30fps dataset ---
@@ -60,7 +60,7 @@ lerobot-train \
     --policy.repo_id=giacomoran/lerobot_policy_act_smooth_30fps_smooth_p4f2 \
     --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_30fps_smooth_p4f2" \
     --policy.input_features='{"observation.state": {"shape": [6], "type": "STATE"}, "observation.images.wrist": {"shape": [3, 640, 480], "type": "VISUAL"}, "observation.images.top": {"shape": [3, 480, 640], "type": "VISUAL"}}' \
-    --steps=30000 \
+    --steps=50000 \
     --save_freq=10000 \
     --batch_size=32 \
     --policy.optimizer_lr=3e-5 \
@@ -80,9 +80,9 @@ echo "=== Resuming 30fps to add extra checkpoints ==="
 
 lerobot-train \
     --resume=true \
-    --config_path="${DIR_BASE}/lerobot_policy_act_smooth_30fps_smooth_p4f2/checkpoints/030000/pretrained_model/train_config.json" \
+    --config_path="${DIR_BASE}/lerobot_policy_act_smooth_30fps_smooth_p4f2/checkpoints/050000/pretrained_model/train_config.json" \
     --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_30fps_smooth_p4f2" \
-    --steps=30003 \
+    --steps=50003 \
     --save_freq=1
 
 echo "=== Training complete ==="

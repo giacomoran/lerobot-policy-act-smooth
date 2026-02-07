@@ -88,7 +88,7 @@ def load_recording_to_dataframe(path_rrd: Path) -> tuple[pd.DataFrame, str]:
     name_index = "frame_nr" if "frame_nr" in cols_index else cols_index[0] if cols_index else "log_tick"
     logging.info(f"Using index: {name_index}")
 
-    view = recording.view(index=name_index, contents="/**").fill_latest_at()
+    view = recording.view(index=name_index, contents="/**")
     table = view.select().read_all()
     logging.info(f"Query completed, got {table.num_rows} rows")
 
@@ -164,13 +164,10 @@ def build_dataframe_observations(
     df_result = pd.DataFrame(rows)
 
     if not df_result.empty:
-        # Drop forward-filled duplicates to avoid staircase artifacts.
-        # fill_latest_at() propagates the last observation value to every frame,
-        # so consecutive rows with the same value are not real observations.
+        # Drop consecutive duplicates to reduce data points for plotting.
         df_result = df_result.sort_values(["name_motor", "idx_frame"])
         shifted = df_result.groupby("name_motor")["value_position"].shift()
-        mask_changed = df_result["value_position"] != shifted
-        df_result = df_result[mask_changed].reset_index(drop=True)
+        df_result = df_result[df_result["value_position"] != shifted].reset_index(drop=True)
 
     return df_result
 
@@ -228,15 +225,6 @@ def build_dataframe_actions(
 
     df_result = pd.DataFrame(rows)
 
-    if not only_control_frames and not df_result.empty:
-        # Drop forward-filled duplicates to avoid staircase artifacts.
-        # fill_latest_at() propagates the last value to every frame,
-        # so consecutive rows with the same value are not real logged actions.
-        df_result = df_result.sort_values(["name_motor", "idx_frame"])
-        shifted = df_result.groupby("name_motor")["value_position"].shift()
-        mask_changed = df_result["value_position"] != shifted
-        df_result = df_result[mask_changed].reset_index(drop=True)
-
     return df_result
 
 
@@ -291,8 +279,8 @@ def create_plot(
 
     Shows three layers per motor:
     - Solid line: observations (actual robot state)
-    - Dashed line: commanded actions (including interpolated frames)
-    - Dots: policy actions (at control frames only)
+    - Small dots: commanded actions (including interpolated frames)
+    - Big dots: policy actions (at control frames only)
 
     Args:
         df_obs: DataFrame with observations (all frames).
@@ -327,18 +315,19 @@ def create_plot(
             size=0.5,
             alpha=0.7,
         ),
-        geom_line(
+        geom_point(
             data=df_action_commanded,
             mapping=aes(x="idx_frame", y="value_position", color="name_motor"),
-            size=0.4,
-            alpha=0.5,
-            linetype="dashed",
+            size=1.2,
+            alpha=0.4,
+            stroke=0,
         ),
         geom_point(
             data=df_action_policy,
             mapping=aes(x="idx_frame", y="value_position", color="name_motor"),
-            size=1.5,
-            alpha=0.4,
+            size=2.0,
+            alpha=0.5,
+            stroke=0,
         ),
         geom_vline(
             data=df_chunk,
@@ -350,7 +339,7 @@ def create_plot(
         ),
         scale_color_manual(values=color_mapping),
         labs(x="Frame index", y="Position (rad)", color="Motor"),
-        ggtitle("Obs (solid), Commands (dashed), Policy actions (dots)"),
+        ggtitle("Obs (line), Commands (small dots), Policy actions (big dots)"),
         theme_publication(),
     ]
 

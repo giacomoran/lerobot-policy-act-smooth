@@ -137,6 +137,7 @@ def _is_scalar(x):
 
 
 def log_rerun_data(
+    idx_frame: int | None = None,
     observation: dict[str, np.ndarray] | None = None,
     action: dict[str, np.ndarray] | None = None,
     timestep: int | None = None,
@@ -151,11 +152,16 @@ def log_rerun_data(
     - Chunk index: /idx_chunk (the current chunk being executed)
 
     Args:
+        idx_frame: Optional observation-rate frame index. Sets the rerun "frame_nr" timeline
+            so all data within a single frame shares the same index.
         observation: Optional dictionary containing observation data to log.
         action: Optional dictionary containing action data to log.
         timestep: Optional control timestep to log.
         idx_chunk: Optional chunk index to log.
     """
+    if idx_frame is not None:
+        rr.set_time_sequence("frame_nr", idx_frame)
+
     if timestep is not None:
         rr.log("/timestep", rr.Scalars(float(timestep)))
 

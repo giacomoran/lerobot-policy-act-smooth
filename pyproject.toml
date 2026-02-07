@@ -10,7 +10,11 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pdbpp>=0.11.7", "ruff>=0.14.11"]
+dev = [
+    "pdbpp>=0.11.7",
+    "pytest>=9.0.2",
+    "ruff>=0.14.11",
+]
 
 [tool.uv]
 # Force av to be compiled from source so it links against the system FFmpeg

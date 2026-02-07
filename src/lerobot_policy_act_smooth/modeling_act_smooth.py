@@ -39,16 +39,16 @@ Training vs Inference
 The model handles delays differently in training vs inference:
 
 **Training:**
-- Evaluates ALL delay values {1, 2, ..., prefix_length_future} for each sample in parallel
-- Input batch has B samples, internally expanded to B*prefix_length_future virtual samples
-- `batch[ACTION]` has shape [B, prefix_length_past + prefix_length_future + chunk_size, action_dim] (full action sequence)
-- `batch[ACTION_IS_PAD]` has shape [B, prefix_length_past + prefix_length_future + chunk_size] (padding mask)
+- Evaluates ALL delay values {1, 2, ..., length_prefix_future} for each sample in parallel
+- Input batch has B samples, internally expanded to B*length_prefix_future virtual samples
+- `batch[ACTION]` has shape [B, length_prefix_past + length_prefix_future + chunk_size, action_dim] (full action sequence)
+- `batch[ACTION_IS_PAD]` has shape [B, length_prefix_past + length_prefix_future + chunk_size] (padding mask)
 - Loss is computed across all delays
 
 **Inference:**
 - Evaluates ONE delay value (determined by the padding mask)
-- `batch[INFERENCE_ACTION]` has shape [B, prefix_length_past + prefix_length_future, action_dim] (history + committed prefix)
-- `batch[INFERENCE_ACTION_IS_PAD]` has shape [B, prefix_length_past + prefix_length_future] (padding mask encodes both history padding and which prefix positions are valid)
+- `batch[INFERENCE_ACTION]` has shape [B, length_prefix_past + length_prefix_future, action_dim] (history + committed prefix)
+- `batch[INFERENCE_ACTION_IS_PAD]` has shape [B, length_prefix_past + length_prefix_future] (padding mask encodes both history padding and which prefix positions are valid)
 - Returns action chunk predictions for the specified delay
 """
 
@@ -108,12 +108,12 @@ class ACTSmoothPolicy(PreTrainedPolicy):
         # Precompute indices to extract target actions from batch[ACTION] for each delay.
         # During training, we evaluate all delays in parallel. For a given delay d, the model
         # predicts a chunk starting d steps into the future, so targets start at index
-        # (prefix_length_past + d) in batch[ACTION].
-        # Shape: [prefix_length_future, chunk_size] - one row per delay value (1, 2, ..., prefix_length_future)
-        delays = torch.arange(1, config.prefix_length_future + 1, dtype=torch.long)
+        # (length_prefix_past + d) in batch[ACTION].
+        # Shape: [length_prefix_future, chunk_size] - one row per delay value (1, 2, ..., length_prefix_future)
+        delays = torch.arange(1, config.length_prefix_future + 1, dtype=torch.long)
         offsets_chunk = torch.arange(config.chunk_size, dtype=torch.long)
         self.register_buffer(
-            "_indices_target", config.prefix_length_past + delays.unsqueeze(1) + offsets_chunk.unsqueeze(0)
+            "_indices_target", config.length_prefix_past + delays.unsqueeze(1) + offsets_chunk.unsqueeze(0)
         )
 
         self.reset()
@@ -143,37 +143,40 @@ class ACTSmoothPolicy(PreTrainedPolicy):
         """Build INFERENCE_ACTION and INFERENCE_ACTION_IS_PAD tensors from action prefix tensors.
 
         Args:
-            action_prefix_future: Tensor [B, prefix_length_future_effective, action_dim]
-                where 1 <= prefix_length_future_effective <= prefix_length_future.
+            action_prefix_future: Tensor [B, length_prefix_future_effective, action_dim]
+                where 1 <= length_prefix_future_effective <= length_prefix_future.
                 Must have at least 1 action (d >= 1) since training uses delays {1..D}.
-            action_prefix_past: Tensor [B, prefix_length_past_effective, action_dim]
-                where prefix_length_past_effective <= prefix_length_past.
+            action_prefix_past: Tensor [B, length_prefix_past_effective, action_dim]
+                where length_prefix_past_effective <= length_prefix_past.
                 Use [B, 0, action_dim] for no past prefix.
 
         Returns:
             Tuple of (inference_action, inference_action_is_pad):
-            - inference_action: [B, prefix_length_past + prefix_length_future, action_dim]
-            - inference_action_is_pad: [B, prefix_length_past + prefix_length_future]
+            - inference_action: [B, length_prefix_past + length_prefix_future, action_dim]
+            - inference_action_is_pad: [B, length_prefix_past + length_prefix_future]
         """
-        prefix_length_future = self.config.prefix_length_future
-        prefix_length_past = self.config.prefix_length_past
-        prefix_length_future_effective = action_prefix_future.shape[1]
-        prefix_length_past_effective = action_prefix_past.shape[1]
+        length_prefix_future = self.config.length_prefix_future
+        length_prefix_past = self.config.length_prefix_past
+        length_prefix_future_effective = action_prefix_future.shape[1]
+        length_prefix_past_effective = action_prefix_past.shape[1]
         batch_size = action_prefix_future.shape[0]
         device = action_prefix_future.device
         dtype = action_prefix_future.dtype
 
-        assert 1 <= prefix_length_future_effective <= prefix_length_future, (
-            f"action_prefix_future has {prefix_length_future_effective} steps, but must have 1 <= d <= {prefix_length_future} "
-            f"(training uses delays {{1..{prefix_length_future}}}, d=0 is out-of-distribution)"
+        # WARNING: Inference code must provide at least 1 action in action_prefix_future.
+        # The model was trained on delays {1..length_prefix_future}, so delay=0 is out-of-distribution.
+        # For the first inference (no prior chunk), use the current robot state as a 1-action prefix.
+        assert 1 <= length_prefix_future_effective <= length_prefix_future, (
+            f"action_prefix_future has {length_prefix_future_effective} steps, but must have 1 <= d <= {length_prefix_future} "
+            f"(training uses delays {{1..{length_prefix_future}}}, d=0 is out-of-distribution)"
         )
-        assert prefix_length_past_effective <= prefix_length_past, (
-            f"action_prefix_past has {prefix_length_past_effective} steps, but prefix_length_past is {prefix_length_past}"
+        assert length_prefix_past_effective <= length_prefix_past, (
+            f"action_prefix_past has {length_prefix_past_effective} steps, but length_prefix_past is {length_prefix_past}"
         )
 
         # 1. Build past portion (past completed actions)
         # Pad at the START (older positions are missing first)
-        length_pad_past = prefix_length_past - prefix_length_past_effective
+        length_pad_past = length_prefix_past - length_prefix_past_effective
         if length_pad_past > 0:
             pad_past = torch.zeros(batch_size, length_pad_past, action_prefix_past.shape[2], device=device, dtype=dtype)
             inference_action_past = torch.cat([pad_past, action_prefix_past], dim=1)
@@ -181,11 +184,11 @@ class ACTSmoothPolicy(PreTrainedPolicy):
             inference_action_past = action_prefix_past
 
         # Past mask: first length_pad_past positions are padded
-        inference_action_is_pad_past = torch.arange(prefix_length_past, device=device)[None, :] < length_pad_past
+        inference_action_is_pad_past = torch.arange(length_prefix_past, device=device)[None, :] < length_pad_past
 
         # 2. Build future portion (committed pending actions)
-        # Pad at the END (positions beyond prefix_length_future_effective are padded)
-        length_pad_future = prefix_length_future - prefix_length_future_effective
+        # Pad at the END (positions beyond length_prefix_future_effective are padded)
+        length_pad_future = length_prefix_future - length_prefix_future_effective
         if length_pad_future > 0:
             pad_future = torch.zeros(
                 batch_size, length_pad_future, action_prefix_future.shape[2], device=device, dtype=dtype
@@ -194,9 +197,9 @@ class ACTSmoothPolicy(PreTrainedPolicy):
         else:
             inference_action_future = action_prefix_future
 
-        # Future mask: positions >= prefix_length_future_effective are padded
+        # Future mask: positions >= length_prefix_future_effective are padded
         inference_action_is_pad_future = (
-            torch.arange(prefix_length_future, device=device)[None, :] >= prefix_length_future_effective
+            torch.arange(length_prefix_future, device=device)[None, :] >= length_prefix_future_effective
         )
 
         # 3. Concatenate into final tensors
@@ -220,8 +223,8 @@ class ACTSmoothPolicy(PreTrainedPolicy):
 
         Args:
             batch: Dictionary containing observation tensors and inference action prefix keys:
-                - INFERENCE_ACTION: [B, prefix_length_past + prefix_length_future, action_dim]
-                - INFERENCE_ACTION_IS_PAD: [B, prefix_length_past + prefix_length_future]
+                - INFERENCE_ACTION: [B, length_prefix_past + length_prefix_future, action_dim]
+                - INFERENCE_ACTION_IS_PAD: [B, length_prefix_past + length_prefix_future]
 
         Returns:
             Tensor of shape (batch_size, chunk_size, action_dim) containing predicted actions.
@@ -245,11 +248,11 @@ class ACTSmoothPolicy(PreTrainedPolicy):
 
         Expected batch keys:
         - OBS_STATE or OBS_ENV_STATE: observation state
-        - ACTION: [B, prefix_length_past + prefix_length_future + chunk_size, action_dim]
-        - ACTION_IS_PAD: [B, prefix_length_past + prefix_length_future + chunk_size] padding mask
+        - ACTION: [B, length_prefix_past + length_prefix_future + chunk_size, action_dim]
+        - ACTION_IS_PAD: [B, length_prefix_past + length_prefix_future + chunk_size] padding mask
         """
-        prefix_length_past = self.config.prefix_length_past
-        prefix_length_future = self.config.prefix_length_future
+        length_prefix_past = self.config.length_prefix_past
+        length_prefix_future = self.config.length_prefix_future
         chunk_size = self.config.chunk_size
 
         if self.config.image_features:
@@ -262,26 +265,26 @@ class ACTSmoothPolicy(PreTrainedPolicy):
         else:
             batch_size = batch[OBS_ENV_STATE].shape[0]
 
-        # batch[ACTION]: [B, prefix_length_past + prefix_length_future + chunk_size, action_dim]
-        expected_length_action = prefix_length_past + prefix_length_future + chunk_size
+        # batch[ACTION]: [B, length_prefix_past + length_prefix_future + chunk_size, action_dim]
+        expected_length_action = length_prefix_past + length_prefix_future + chunk_size
         actual_length_action = batch[ACTION].shape[1]
         assert actual_length_action == expected_length_action, (
             f"batch[ACTION].shape[1]={actual_length_action} must equal "
-            f"prefix_length_past + prefix_length_future + chunk_size = {prefix_length_past} + {prefix_length_future} + {chunk_size} = {expected_length_action}. "
+            f"length_prefix_past + length_prefix_future + chunk_size = {length_prefix_past} + {length_prefix_future} + {chunk_size} = {expected_length_action}. "
             f"Check that action_delta_indices matches: {self.config.action_delta_indices}"
         )
 
-        # Inner model returns [B*prefix_length_future, chunk_size, action_dim] during training
+        # Inner model returns [B*length_prefix_future, chunk_size, action_dim] during training
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        # Reshape predictions: [B*prefix_length_future, chunk_size, action_dim] -> [B, prefix_length_future, chunk_size, action_dim]
-        actions_hat = actions_hat.reshape(batch_size, prefix_length_future, chunk_size, -1)
+        # Reshape predictions: [B*length_prefix_future, chunk_size, action_dim] -> [B, length_prefix_future, chunk_size, action_dim]
+        actions_hat = actions_hat.reshape(batch_size, length_prefix_future, chunk_size, -1)
 
         # Extract targets for each delay using precomputed indices
-        targets = batch[ACTION][:, self._indices_target]  # [B, prefix_length_future, chunk_size, action_dim]
+        targets = batch[ACTION][:, self._indices_target]  # [B, length_prefix_future, chunk_size, action_dim]
 
         # Extract padding mask for each delay
-        action_is_pad = batch[ACTION_IS_PAD][:, self._indices_target]  # [B, prefix_length_future, chunk_size]
+        action_is_pad = batch[ACTION_IS_PAD][:, self._indices_target]  # [B, length_prefix_future, chunk_size]
 
         # Compute L1 loss with padding mask
         l1_loss = (F.l1_loss(targets, actions_hat, reduction="none") * ~action_is_pad.unsqueeze(-1)).mean()
@@ -300,7 +303,7 @@ class ACTSmoothPolicy(PreTrainedPolicy):
 class ACTSmooth(nn.Module):
     """ACTSmooth: The underlying neural network for ACTSmoothPolicy.
 
-    Always uses delay conditioning (prefix_length_future >= 1). For vanilla ACT without delay conditioning,
+    Always uses delay conditioning (length_prefix_future >= 1). For vanilla ACT without delay conditioning,
     use the standard ACT policy instead.
 
     Token ordering in encoder: [images, latent, env_state, robot_state, prefix_past, prefix_future]
@@ -354,8 +357,8 @@ class ACTSmooth(nn.Module):
             n_1d_tokens += 1
         if self.config.env_state_feature:
             n_1d_tokens += 1
-        n_1d_tokens += config.prefix_length_past
-        n_1d_tokens += config.prefix_length_future
+        n_1d_tokens += config.length_prefix_past
+        n_1d_tokens += config.length_prefix_future
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
             self.encoder_cam_feat_pos_embed = ACTSmoothSinusoidalPositionEmbedding2d(config.dim_model // 2)
@@ -381,14 +384,15 @@ class ACTSmooth(nn.Module):
         - Training batch: ACTION and ACTION_IS_PAD
         - Inference batch: INFERENCE_ACTION and INFERENCE_ACTION_IS_PAD
         """
-        prefix_length_past = self.config.prefix_length_past
-        prefix_length_future = self.config.prefix_length_future
+        length_prefix_past = self.config.length_prefix_past
+        length_prefix_future = self.config.length_prefix_future
 
-        # Infer mode from keys so eval() can still run loss computation on training batches.
-        has_action = ACTION in batch
-        has_action_is_pad = ACTION_IS_PAD in batch
-        has_inference_action = INFERENCE_ACTION in batch
-        has_inference_action_is_pad = INFERENCE_ACTION_IS_PAD in batch
+        # Infer mode from keys so model.eval() can still run loss computation on training batches.
+        # Use .get() to check for actual values, not just key existence (preprocessor adds ACTION: None).
+        has_action = batch.get(ACTION) is not None
+        has_action_is_pad = batch.get(ACTION_IS_PAD) is not None
+        has_inference_action = batch.get(INFERENCE_ACTION) is not None
+        has_inference_action_is_pad = batch.get(INFERENCE_ACTION_IS_PAD) is not None
 
         assert has_action == has_action_is_pad, (
             f"Batch must provide both {ACTION} and {ACTION_IS_PAD}, or neither. "
@@ -434,9 +438,9 @@ class ACTSmooth(nn.Module):
             actions = batch[ACTION]
 
             # VAE encoder - runs on original batch_size before expansion
-            # VAE targets are for d=1: actions starting at index prefix_length_past + 1
+            # VAE targets are for d=1: actions starting at index length_prefix_past + 1
             if self.config.use_vae:
-                target_start_idx = prefix_length_past + 1  # d=1 target starts at t_1
+                target_start_idx = length_prefix_past + 1  # d=1 target starts at t_1
                 action_targets = actions[:, target_start_idx : target_start_idx + self.config.chunk_size]
                 action_is_pad_targets = batch[ACTION_IS_PAD][
                     :, target_start_idx : target_start_idx + self.config.chunk_size
@@ -501,38 +505,38 @@ class ACTSmooth(nn.Module):
 
             # Expand batch to evaluate all delays in parallel (see module docstring)
             # Expansion happens AFTER backbone (expensive CNN runs once per sample, not per delay)
-            # Delays are {1, 2, ..., prefix_length_future} (d >= 1 because t_0 is always committed)
+            # Delays are {1, 2, ..., length_prefix_future} (d >= 1 because t_0 is always committed)
             n_tokens = encoder_in_tokens.shape[0]
-            batch_size_effective = batch_size * prefix_length_future
+            batch_size_effective = batch_size * length_prefix_future
 
-            # Expand encoder tokens: [n_tokens, B, dim] -> [n_tokens, B*prefix_length_future, dim]
-            encoder_in_tokens = encoder_in_tokens.unsqueeze(2).expand(-1, -1, prefix_length_future, -1)
+            # Expand encoder tokens: [n_tokens, B, dim] -> [n_tokens, B*length_prefix_future, dim]
+            encoder_in_tokens = encoder_in_tokens.unsqueeze(2).expand(-1, -1, length_prefix_future, -1)
             encoder_in_tokens = encoder_in_tokens.reshape(n_tokens, batch_size_effective, -1)
 
-            # Expand pos_embed: [n_tokens, 1, dim] -> [n_tokens, B*prefix_length_future, dim]
+            # Expand pos_embed: [n_tokens, 1, dim] -> [n_tokens, B*length_prefix_future, dim]
             encoder_in_pos_embed = encoder_in_pos_embed.expand(-1, batch_size_effective, -1)
 
-            # Create delays for all delay values: [prefix_length_future] -> [B*prefix_length_future]
-            # delays are 1, 2, ..., prefix_length_future (NOT 0, 1, ..., prefix_length_future)
-            delays = torch.arange(1, prefix_length_future + 1, dtype=torch.long, device=device)
+            # Create delays for all delay values: [length_prefix_future] -> [B*length_prefix_future]
+            # delays are 1, 2, ..., length_prefix_future (NOT 0, 1, ..., length_prefix_future)
+            delays = torch.arange(1, length_prefix_future + 1, dtype=torch.long, device=device)
             delays = delays.unsqueeze(0).expand(batch_size, -1).reshape(-1)
 
-            # Expand actions: [B, seq_len, action_dim] -> [B*prefix_length_future, seq_len, action_dim]
+            # Expand actions: [B, seq_len, action_dim] -> [B*length_prefix_future, seq_len, action_dim]
             actions = (
                 actions.unsqueeze(1)
-                .expand(-1, prefix_length_future, -1, -1)
+                .expand(-1, length_prefix_future, -1, -1)
                 .reshape(batch_size_effective, -1, actions.shape[-1])
             )
 
             # 5. Action history (past completed actions) - learnable pos embed
-            if prefix_length_past > 0:
-                action_prefix_past = actions[:, :prefix_length_past]
-                is_pad_prefix_past = batch[ACTION_IS_PAD][:, :prefix_length_past]
+            if length_prefix_past > 0:
+                action_prefix_past = actions[:, :length_prefix_past]
+                is_pad_prefix_past = batch[ACTION_IS_PAD][:, :length_prefix_past]
                 # Expand padding mask for training
                 is_pad_prefix_past = (
                     is_pad_prefix_past.unsqueeze(1)
-                    .expand(-1, prefix_length_future, -1)
-                    .reshape(batch_size_effective, prefix_length_past)
+                    .expand(-1, length_prefix_future, -1)
+                    .reshape(batch_size_effective, length_prefix_past)
                 )
 
                 embed_prefix_past = self.encoder_action_prefix_input_proj(action_prefix_past)
@@ -544,29 +548,29 @@ class ACTSmooth(nn.Module):
                     embed_prefix_past,
                 )
 
-                tokens_prefix_past = embed_prefix_past.permute(1, 0, 2)  # [prefix_length_past, B_eff, dim]
+                tokens_prefix_past = embed_prefix_past.permute(1, 0, 2)  # [length_prefix_past, B_eff, dim]
                 encoder_in_tokens = torch.cat([encoder_in_tokens, tokens_prefix_past], dim=0)
 
                 # Positional embeddings for history
                 pos_embed_prefix_past = self.encoder_1d_feature_pos_embed.weight[
-                    pos_1d_idx : pos_1d_idx + prefix_length_past
+                    pos_1d_idx : pos_1d_idx + length_prefix_past
                 ]
                 pos_embed_prefix_past = pos_embed_prefix_past.unsqueeze(1).expand(-1, batch_size_effective, -1)
                 encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, pos_embed_prefix_past], dim=0)
-                pos_1d_idx += prefix_length_past
+                pos_1d_idx += length_prefix_past
 
             # 6. Committed pending actions - learnable pos embed
-            action_prefix_future = actions[:, prefix_length_past : prefix_length_past + prefix_length_future]
+            action_prefix_future = actions[:, length_prefix_past : length_prefix_past + length_prefix_future]
 
             # Compute mask from delays and ACTION_IS_PAD
-            pad_prefix_future = batch[ACTION_IS_PAD][:, prefix_length_past : prefix_length_past + prefix_length_future]
+            pad_prefix_future = batch[ACTION_IS_PAD][:, length_prefix_past : length_prefix_past + length_prefix_future]
             pad_prefix_future = (
                 pad_prefix_future.unsqueeze(1)
-                .expand(-1, prefix_length_future, -1)
-                .reshape(batch_size_effective, prefix_length_future)
+                .expand(-1, length_prefix_future, -1)
+                .reshape(batch_size_effective, length_prefix_future)
             )
             is_pad_prefix_future = (
-                torch.arange(prefix_length_future, device=device)[None, :] >= delays[:, None]
+                torch.arange(length_prefix_future, device=device)[None, :] >= delays[:, None]
             ) | pad_prefix_future
 
             embed_prefix_future = self.encoder_action_prefix_input_proj(action_prefix_future)
@@ -578,12 +582,12 @@ class ACTSmooth(nn.Module):
                 embed_prefix_future,
             )
 
-            tokens_prefix_future = embed_prefix_future.permute(1, 0, 2)  # [prefix_length_future, B_eff, dim]
+            tokens_prefix_future = embed_prefix_future.permute(1, 0, 2)  # [length_prefix_future, B_eff, dim]
             encoder_in_tokens = torch.cat([encoder_in_tokens, tokens_prefix_future], dim=0)
 
             # Positional embeddings for action prefix
             pos_embed_prefix_future = self.encoder_1d_feature_pos_embed.weight[
-                pos_1d_idx : pos_1d_idx + prefix_length_future
+                pos_1d_idx : pos_1d_idx + length_prefix_future
             ]
             pos_embed_prefix_future = pos_embed_prefix_future.unsqueeze(1).expand(-1, batch_size_effective, -1)
             encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, pos_embed_prefix_future], dim=0)
@@ -622,9 +626,9 @@ class ACTSmooth(nn.Module):
             encoder_in_pos_embed = encoder_in_pos_embed.expand(-1, batch_size_effective, -1)
 
             # 5. Action history (past completed actions) - learnable pos embed
-            if prefix_length_past > 0:
-                action_prefix_past = inference_action[:, :prefix_length_past]
-                is_pad_prefix_past = inference_action_is_pad[:, :prefix_length_past]
+            if length_prefix_past > 0:
+                action_prefix_past = inference_action[:, :length_prefix_past]
+                is_pad_prefix_past = inference_action_is_pad[:, :length_prefix_past]
 
                 embed_prefix_past = self.encoder_action_prefix_input_proj(action_prefix_past)
 
@@ -635,21 +639,21 @@ class ACTSmooth(nn.Module):
                     embed_prefix_past,
                 )
 
-                tokens_prefix_past = embed_prefix_past.permute(1, 0, 2)  # [prefix_length_past, B_eff, dim]
+                tokens_prefix_past = embed_prefix_past.permute(1, 0, 2)  # [length_prefix_past, B_eff, dim]
                 encoder_in_tokens = torch.cat([encoder_in_tokens, tokens_prefix_past], dim=0)
 
                 # Positional embeddings for history
                 pos_embed_prefix_past = self.encoder_1d_feature_pos_embed.weight[
-                    pos_1d_idx : pos_1d_idx + prefix_length_past
+                    pos_1d_idx : pos_1d_idx + length_prefix_past
                 ]
                 pos_embed_prefix_past = pos_embed_prefix_past.unsqueeze(1).expand(-1, batch_size_effective, -1)
                 encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, pos_embed_prefix_past], dim=0)
-                pos_1d_idx += prefix_length_past
+                pos_1d_idx += length_prefix_past
 
             # 6. Committed pending actions - learnable pos embed
-            action_prefix_future = inference_action[:, prefix_length_past:]
+            action_prefix_future = inference_action[:, length_prefix_past:]
             # INFERENCE_ACTION_IS_PAD already encodes which positions are valid
-            is_pad_prefix_future = inference_action_is_pad[:, prefix_length_past:]
+            is_pad_prefix_future = inference_action_is_pad[:, length_prefix_past:]
 
             embed_prefix_future = self.encoder_action_prefix_input_proj(action_prefix_future)
 
@@ -660,12 +664,12 @@ class ACTSmooth(nn.Module):
                 embed_prefix_future,
             )
 
-            tokens_prefix_future = embed_prefix_future.permute(1, 0, 2)  # [prefix_length_future, B_eff, dim]
+            tokens_prefix_future = embed_prefix_future.permute(1, 0, 2)  # [length_prefix_future, B_eff, dim]
             encoder_in_tokens = torch.cat([encoder_in_tokens, tokens_prefix_future], dim=0)
 
             # Positional embeddings for action prefix
             pos_embed_prefix_future = self.encoder_1d_feature_pos_embed.weight[
-                pos_1d_idx : pos_1d_idx + prefix_length_future
+                pos_1d_idx : pos_1d_idx + length_prefix_future
             ]
             pos_embed_prefix_future = pos_embed_prefix_future.unsqueeze(1).expand(-1, batch_size_effective, -1)
             encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, pos_embed_prefix_future], dim=0)

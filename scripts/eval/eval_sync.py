@@ -210,6 +210,7 @@ def run_episode_sync(
     ts_start_episode = time.perf_counter()
     idx_chunk = 0
     count_total_actions = 0
+    count_frames_obs = 0
 
     while True:
         duration_s_episode = time.perf_counter() - ts_start_episode
@@ -265,13 +266,19 @@ def run_episode_sync(
                     count_total_actions += 1
 
                 if cfg.display_data:
-                    dict_obs_vis = robot.get_observation()
+                    if is_control_frame:
+                        dict_obs_vis = robot.get_observation()
+                    else:
+                        dict_obs_motors = robot.bus.sync_read("Present_Position")
+                        dict_obs_vis = {f"{motor}.pos": val for motor, val in dict_obs_motors.items()}
                     log_rerun_data(
                         timestep=count_total_actions,
                         idx_chunk=idx_chunk if is_control_frame else None,
                         observation=dict_obs_vis,
                         action=robot_action if is_control_frame else None,
                     )
+
+                count_frames_obs += 1
 
                 duration_s_frame = time.perf_counter() - ts_start_frame
                 duration_s_sleep = duration_s_frame_target - duration_s_frame
@@ -281,8 +288,13 @@ def run_episode_sync(
         idx_chunk += 1
 
     duration_s_total = time.perf_counter() - ts_start_episode
-    fps_actual = count_total_actions / duration_s_total if duration_s_total > 0 else 0
-    logging.info(f"Episode complete: {count_total_actions} actions in {duration_s_total:.1f}s ({fps_actual:.1f} fps)")
+    fps_obs_real = count_frames_obs / duration_s_total if duration_s_total > 0 else 0
+    fps_control_real = count_total_actions / duration_s_total if duration_s_total > 0 else 0
+    logging.info(f"Episode complete: {count_total_actions} actions in {duration_s_total:.1f}s")
+    logging.info(
+        f"Real FPS: observation={fps_obs_real:.1f} (target={cfg.fps_observation}), "
+        f"control={fps_control_real:.1f} (target={cfg.fps_policy})"
+    )
 
     if cfg.display_data:
         tracker_latency.log_summary_to_rerun()

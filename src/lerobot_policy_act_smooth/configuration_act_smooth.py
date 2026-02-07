@@ -103,18 +103,29 @@ class ACTSmoothConfig(PreTrainedConfig):
     # Prefix = [past completed actions] + [committed pending actions]
     #          |---- k actions (fixed) ----|  |---- d actions (variable, d >= 1) ---|
     #
-    # - prefix_length_past (k): Number of past (completed) actions to include in prefix.
+    # - length_prefix_past (k): Number of past (completed) actions to include in prefix.
     #   These provide historical context for continuity without adding delay.
-    # - prefix_length_future: Maximum number of committed (pending) actions.
-    #   During training, d is sampled from {1, ..., prefix_length_future}.
-    #   Note: d >= 1 because a_{t_0} is always committed due to inference latency.
+    # - length_prefix_future (D): Maximum number of committed (pending) actions.
+    #   During training, d is sampled from {1, ..., D}.
     #
-    # Example at 30fps with k=4, d=2:
+    # Choosing length_prefix_future (D):
+    #   The committed actions are t_0, t_1, ..., t_{d-1} where t_0 is at the observation
+    #   timestep. t_0 is already being executed when inference starts, so only the remaining
+    #   d-1 actions absorb inference latency. You need:
+    #
+    #       (d - 1) / fps > inference_latency
+    #       D >= ceil(inference_latency * fps) + 1
+    #
+    #   Examples (assuming 35ms inference latency):
+    #     10 FPS: D=2 → (2-1)/10 = 100ms > 35ms ✓
+    #     30 FPS: D=3 → (3-1)/30 =  67ms > 35ms ✓
+    #
+    # Example at 30fps with k=4, D=2:
     #   Prefix = [4 past actions, 2 committed] = 6 total (200ms context)
     #   But delay = only 2 (67ms until new chunk starts)
     #   Best of both: rich context for continuity + fast reactivity
-    prefix_length_past: int = 0
-    prefix_length_future: int = 1
+    length_prefix_past: int = 0
+    length_prefix_future: int = 1
     # Deprecated: kept for backward compatibility with older configs/CLI.
     max_delay: int | None = None
 
@@ -160,8 +171,8 @@ class ACTSmoothConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if self.max_delay is not None and self.prefix_length_future == 1:
-            self.prefix_length_future = self.max_delay
+        if self.max_delay is not None and self.length_prefix_future == 1:
+            self.length_prefix_future = self.max_delay
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}.")
         if self.n_action_steps > self.chunk_size:
@@ -171,13 +182,13 @@ class ACTSmoothConfig(PreTrainedConfig):
             )
         if self.n_obs_steps != 1:
             raise ValueError(f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`")
-        if self.prefix_length_future < 1:
+        if self.length_prefix_future < 1:
             raise ValueError(
-                f"prefix_length_future must be >= 1 (t_0 is always committed due to inference latency). "
-                f"Got {self.prefix_length_future}. For no delay conditioning, use vanilla ACT instead."
+                f"length_prefix_future must be >= 1 (t_0 is always committed due to inference latency). "
+                f"Got {self.length_prefix_future}. For no delay conditioning, use vanilla ACT instead."
             )
-        if self.prefix_length_past < 0:
-            raise ValueError(f"prefix_length_past must be >= 0. Got {self.prefix_length_past}.")
+        if self.length_prefix_past < 0:
+            raise ValueError(f"length_prefix_past must be >= 0. Got {self.length_prefix_past}.")
 
     @classmethod
     def from_pretrained(
@@ -233,8 +244,8 @@ class ACTSmoothConfig(PreTrainedConfig):
         # Remove legacy/registry fields and map deprecated keys.
         config.pop("type", None)
         max_delay = config.pop("max_delay", None)
-        if max_delay is not None and "prefix_length_future" not in config:
-            config["prefix_length_future"] = max_delay
+        if max_delay is not None and "length_prefix_future" not in config:
+            config["length_prefix_future"] = max_delay
 
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)
@@ -265,7 +276,7 @@ class ACTSmoothConfig(PreTrainedConfig):
     def action_delta_indices(self) -> list:
         """Indices for loading action sequences relative to observation timestep.
 
-        batch[ACTION] layout (k = prefix_length_past, D = prefix_length_future, C = chunk_size):
+        batch[ACTION] layout (k = length_prefix_past, D = length_prefix_future, C = chunk_size):
 
             [t_{-k}, ..., t_{-1}, t_0, t_1, ..., t_{D-1}, t_D, ..., t_{D+C-1}]
             |------ k past ------|  |---- D committed ----|  |--- C target ---|
@@ -274,8 +285,8 @@ class ACTSmoothConfig(PreTrainedConfig):
 
         Note: t_0 is always committed (delay d >= 1), so prediction target starts at t_d.
         """
-        start = -self.prefix_length_past
-        end = self.prefix_length_future + self.chunk_size
+        start = -self.length_prefix_past
+        end = self.length_prefix_future + self.chunk_size
         return list(range(start, end))
 
     @property

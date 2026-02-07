@@ -45,7 +45,6 @@ result-*
 .env.*.local
 
 # IDE / Editor
-.vscode/
 .idea/
 *.swp
 *.swo

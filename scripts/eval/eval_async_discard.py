@@ -154,6 +154,10 @@ class State:
 
     is_inference_running: bool = False
 
+    # Final counts from actor thread (set on shutdown)
+    count_frames_obs: int = 0
+    count_actions_executed: int = 0
+
     event_inference_requested: Event | None = None
     event_shutdown: Event | None = None
 
@@ -180,6 +184,7 @@ def thread_actor_fn(
     fps_target = cfg.fps_observation
     duration_s_frame_target = 1.0 / fps_target
     count_executed_actions = 0
+    count_frames_obs = 0
     action_chunk_current: ActionChunk | None = None
 
     num_frames_per_control_frame = cfg.fps_observation // cfg.fps_policy
@@ -197,7 +202,11 @@ def thread_actor_fn(
 
             is_control_frame = (idx_frame % num_frames_per_control_frame) == 0
 
-            dict_obs = robot.get_observation()
+            if is_control_frame:
+                dict_obs = robot.get_observation()
+            else:
+                dict_obs_motors = robot.bus.sync_read("Present_Position")
+                dict_obs = {f"{motor}.pos": val for motor, val in dict_obs_motors.items()}
 
             if is_control_frame:
                 with state.lock:
@@ -289,6 +298,7 @@ def thread_actor_fn(
                     action=robot_action_last_executed if is_control_frame else None,
                 )
 
+            count_frames_obs += 1
             idx_frame += 1
 
             duration_s_frame = time.perf_counter() - ts_start_frame
@@ -300,6 +310,8 @@ def thread_actor_fn(
         state.event_shutdown.set()
         sys.exit(1)
 
+    state.count_frames_obs = count_frames_obs
+    state.count_actions_executed = count_executed_actions
     logging.info(f"[ACTOR] Thread shutting down. Total actions executed: {count_executed_actions}")
 
 
@@ -579,6 +591,14 @@ def main(cfg: EvalAsyncDiscardConfig) -> None:
         if ts_start_episode is not None and state is not None:
             duration_s_episode = time.perf_counter() - ts_start_episode
             logging.info(f"Episode completed in {duration_s_episode:.1f}s")
+
+            if duration_s_episode > 0:
+                fps_obs_real = state.count_frames_obs / duration_s_episode
+                fps_control_real = state.count_actions_executed / duration_s_episode
+                logging.info(
+                    f"Real FPS: observation={fps_obs_real:.1f} (target={cfg.fps_observation}), "
+                    f"control={fps_control_real:.1f} (target={cfg.fps_policy})"
+                )
 
             if cfg.display_data:
                 tracker_latency.log_summary_to_rerun()

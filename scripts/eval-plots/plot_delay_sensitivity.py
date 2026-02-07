@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-"""Plot ACTSmooth sensitivity to action prefix delay and translation offsets.
+"""Plot ACTSmooth sensitivity to action prefix.
 
-This script tests how the policy responds to:
-1. Different delay values (0 to max_delay) with ground truth action prefix
-2. Translated/offset action prefixes at max delay
+Experiments:
+1. Sensitivity: vary future prefix length d in {1..D}, full past prefix, no offset
+2. Translation future: fix d=D, full past prefix, vary offset on future prefix
+3. Translation past: fix d=D, full future prefix, vary offset on past prefix
 
 Usage:
     python scripts/eval-plots/plot_delay_sensitivity.py \
@@ -26,6 +27,8 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.processor.normalize_processor import NormalizerProcessorStep
 from lerobot.utils.utils import init_logging
+from matplotlib import colormaps as mpl_colormaps
+from matplotlib.colors import to_hex
 from plotnine import (
     aes,
     facet_wrap,
@@ -34,14 +37,15 @@ from plotnine import (
     ggplot,
     ggtitle,
     labs,
-    scale_color_cmap,
     scale_color_gradient2,
+    scale_color_manual,
 )
 
 from utils_plotting import save_plot, theme_publication
 
 # Import ACTSmooth for type registration and loading
 from lerobot_policy_act_smooth import ACTSmoothConfig, ACTSmoothPolicy  # noqa: F401
+from lerobot_policy_act_smooth.modeling_act_smooth import INFERENCE_ACTION, INFERENCE_ACTION_IS_PAD
 
 
 # ============================================================================
@@ -80,530 +84,122 @@ class ConfigDelaySensitivity:
 
 
 # ============================================================================
-# Dataset Loading
+# Core
 # ============================================================================
 
 
 def load_dataset_for_episode(
     id_repo: str,
     idx_episode: int,
-    max_delay: int,
+    length_prefix_past: int,
+    length_prefix_future: int,
     chunk_size: int,
     fps: int,
     backend_video: str,
     meta_dataset: LeRobotDatasetMetadata,
 ) -> LeRobotDataset:
-    """Load dataset with extended delta_timestamps for analysis.
+    """Load dataset with action delta_timestamps covering [t-K, t+D+C).
 
-    For delay=d, we need:
-    - Prefix: actions at t, ..., t+d-1 (indices 0 to d-1 in loaded data)
-    - Ground truth: actions at t+d, ..., t+d+chunk_size-1 (indices d to d+chunk_size-1)
-
-    So we need indices 0 to max_delay+chunk_size-1 (total: max_delay+chunk_size actions).
-
-    Args:
-        id_repo: HuggingFace dataset repo ID.
-        idx_episode: Episode index to load.
-        max_delay: Maximum delay from policy config.
-        chunk_size: Chunk size from policy config.
-        fps: Dataset FPS.
-        backend_video: Video backend to use.
-        meta_dataset: Dataset metadata.
-
-    Returns:
-        LeRobotDataset with extended action delta_timestamps.
+    The loaded action sequence layout is:
+        [past(K) | future(D) | target(C)]
+    where index K corresponds to t=0 (observation time).
     """
     delta_timestamps = {
-        "action": [i / fps for i in range(0, max_delay + chunk_size)],
+        "action": [i / fps for i in range(-length_prefix_past, length_prefix_future + chunk_size)],
         "observation.state": [0],
     }
-
     for key in meta_dataset.features:
         if key.startswith("observation.images."):
             delta_timestamps[key] = [0]
 
-    dataset = LeRobotDataset(
+    return LeRobotDataset(
         id_repo,
         episodes=[idx_episode],
         delta_timestamps=delta_timestamps,
         video_backend=backend_video,
     )
 
-    return dataset
 
-
-# ============================================================================
-# Sampling
-# ============================================================================
-
-
-def sample_indices_observation(
-    idx_from_episode: int,
-    idx_to_episode: int,
-    max_delay: int,
-    chunk_size: int,
-    n_samples: int,
-    seed: int,
-) -> list[int]:
-    """Sample observation indices from valid range in episode.
-
-    Valid range ensures enough future actions for all delays up to max_delay + chunk_size.
-
-    Args:
-        idx_from_episode: Episode start index in dataset.
-        idx_to_episode: Episode end index in dataset.
-        max_delay: Maximum delay.
-        chunk_size: Action chunk size.
-        n_samples: Number of samples to draw.
-        seed: Random seed.
-
-    Returns:
-        List of sampled observation indices (global dataset indices).
-    """
-    idx_valid_from = idx_from_episode
-    idx_valid_to = idx_to_episode - max_delay - chunk_size
-
-    if idx_valid_to <= idx_valid_from:
-        raise ValueError(f"Episode too short for sampling: valid range [{idx_valid_from}, {idx_valid_to}) is empty")
-
-    rng = np.random.RandomState(seed)
-    indices_sampled = rng.choice(
-        range(idx_valid_from, idx_valid_to),
-        size=min(n_samples, idx_valid_to - idx_valid_from),
-        replace=False,
-    )
-
-    return sorted(indices_sampled.tolist())
-
-
-# ============================================================================
-# Prefix Computation
-# ============================================================================
-
-
-def compute_prefix(
-    sample: dict,
-    delay: int,
-    device: torch.device,
-    offset: float = 0.0,
-) -> torch.Tensor | None:
-    """Compute action prefix from episode data.
-
-    The prefix consists of the FIRST `delay` actions (t to t+delay-1).
-
-    Args:
-        sample: Dataset sample with action delta_timestamps starting at 0/fps.
-        delay: Current delay value.
-        device: Device to use.
-        offset: Offset to add to prefix values (applied proportionally).
-
-    Returns:
-        Absolute action prefix [1, delay, action_dim] or None if delay=0.
-    """
-    if delay == 0:
-        return None
-
-    actions_all = sample["action"]  # [max_delay + chunk_size, action_dim]
-    prefix_absolute = actions_all[:delay]  # [delay, action_dim]
-
-    if offset != 0.0:
-        offsets_proportional = torch.linspace(1.0 / delay, 1.0, delay).unsqueeze(1).to(prefix_absolute.device)
-        prefix_absolute = prefix_absolute + offset * offsets_proportional
-
-    return prefix_absolute.unsqueeze(0).to(device)  # [1, delay, action_dim]
-
-
-# ============================================================================
-# Inference
-# ============================================================================
-
-
-def predict_with_prefix(
+def predict_for_condition(
     policy: ACTSmoothPolicy,
     preprocessor,
     postprocessor,
     sample: dict,
     device: torch.device,
-    action_prefix: torch.Tensor | None,
+    length_prefix_past: int,
+    delay: int,
+    length_past: int,
+    offset_future: float = 0.0,
+    offset_past: float = 0.0,
 ) -> np.ndarray:
-    """Predict action chunk with given prefix.
+    """Run one inference with specified prefix condition.
 
     Args:
-        policy: Policy instance.
-        preprocessor: Preprocessor pipeline.
-        postprocessor: Postprocessor pipeline for unnormalization.
-        sample: Dataset sample.
-        device: Device to use.
-        action_prefix: Absolute action prefix [1, delay, action_dim] or None.
+        sample: Dataset sample. sample["action"] has layout [past(K) | future(D) | target(C)].
+        length_prefix_past: K from policy config (offset to t=0 in action array).
+        delay: Future prefix length d (1..D). Determines which d actions starting at t=0 are given.
+        length_past: How many past actions to use (0..K).
+        offset_future: Constant additive offset applied to the future prefix.
+        offset_past: Constant additive offset applied to the past prefix.
 
     Returns:
-        Predicted absolute action chunk [chunk_size, action_dim].
+        Predicted action chunk [chunk_size, action_dim].
     """
-    state_t = sample["observation.state"].squeeze(0)  # [state_dim]
+    K = length_prefix_past
+    actions_all = sample["action"]
 
+    # Future prefix: actions at [t=0, t=d-1], i.e. indices [K, K+delay)
+    prefix_future = actions_all[K : K + delay].clone()
+    if offset_future != 0.0:
+        prefix_future = prefix_future + offset_future
+    prefix_future = prefix_future.unsqueeze(0).to(device)
+
+    # Past prefix: most recent length_past actions before t=0, i.e. indices [K-length_past, K)
+    if length_past > 0:
+        prefix_past = actions_all[K - length_past : K].clone()
+        if offset_past != 0.0:
+            prefix_past = prefix_past + offset_past
+        prefix_past = prefix_past.unsqueeze(0).to(device)
+    else:
+        prefix_past = torch.zeros(1, 0, actions_all.shape[-1], device=device)
+
+    # Build observation batch
+    state_t = sample["observation.state"].squeeze(0)
     batch = {"observation.state": state_t.unsqueeze(0).to(device)}
     for key in sample:
         if key.startswith("observation.images.") and not key.endswith("_is_pad"):
             img = sample[key]
             if img.ndim == 4:
-                img = img[-1]  # Get image at t (last frame)
+                img = img[-1]
             batch[key] = img.unsqueeze(0).to(device)
 
     batch = preprocessor(batch)
 
-    # IMPORTANT: Normalize action_prefix to match training format.
-    # During training, batch[ACTION] is normalized by the preprocessor.
-    # At inference, we must normalize the action_prefix the same way.
-    # We use the normalizer step directly since process_action goes through
-    # all pipeline steps (including observation-required ones).
-    if action_prefix is not None:
-        for step in preprocessor.steps:
-            if isinstance(step, NormalizerProcessorStep):
-                action_prefix = step._normalize_action(action_prefix, inverse=False)
-                break
+    # Remove non-observation keys added by the preprocessor (e.g. "action",
+    # "next.reward") — they confuse the model's training-vs-inference detection.
+    for key in list(batch):
+        if not key.startswith("observation"):
+            del batch[key]
+
+    # Normalize prefixes to match training format
+    for step in preprocessor.steps:
+        if isinstance(step, NormalizerProcessorStep):
+            prefix_future = step._normalize_action(prefix_future, inverse=False)
+            if prefix_past.shape[1] > 0:
+                prefix_past = step._normalize_action(prefix_past, inverse=False)
+            break
+
+    inference_action, inference_action_is_pad = policy.build_inference_action_prefix(
+        action_prefix_future=prefix_future,
+        action_prefix_past=prefix_past,
+    )
+    batch[INFERENCE_ACTION] = inference_action
+    batch[INFERENCE_ACTION_IS_PAD] = inference_action_is_pad
 
     with torch.no_grad():
-        actions_normalized = policy.predict_action_chunk(batch, action_prefix=action_prefix)
-        # Unnormalize: postprocessor expects [B, chunk_size, action_dim]
-        actions = postprocessor(actions_normalized)
+        actions = postprocessor(policy.predict_action_chunk(batch))
 
     return actions[0].cpu().numpy()
-
-
-# ============================================================================
-# Experiments
-# ============================================================================
-
-
-def run_experiment_delay(
-    policy: ACTSmoothPolicy,
-    preprocessor,
-    postprocessor,
-    sample: dict,
-    max_delay: int,
-    chunk_size: int,
-    device: torch.device,
-) -> dict:
-    """Run delay experiment for a single observation.
-
-    Args:
-        policy: Policy instance.
-        preprocessor: Preprocessor pipeline.
-        postprocessor: Postprocessor pipeline for unnormalization.
-        sample: Dataset sample.
-        max_delay: Maximum delay.
-        chunk_size: Action chunk size.
-        device: Device to use.
-
-    Returns:
-        Dictionary with delays, predictions, prefixes, and ground truths.
-    """
-    delays = list(range(max_delay + 1))
-    predictions = []
-    prefixes = []
-    truths_ground = []
-
-    actions_all = sample["action"]  # [max_delay + chunk_size, action_dim]
-
-    for delay in delays:
-        action_prefix = compute_prefix(sample, delay, device)
-
-        if delay > 0:
-            prefix_absolute = actions_all[:delay]
-            prefixes.append(prefix_absolute.cpu().numpy())
-        else:
-            prefixes.append(None)
-
-        # Ground truth for delay=d is actions_all[d:d+chunk_size]
-        truth_ground = actions_all[delay : delay + chunk_size]
-        truths_ground.append(truth_ground.cpu().numpy())
-
-        pred = predict_with_prefix(policy, preprocessor, postprocessor, sample, device, action_prefix)
-        predictions.append(pred)
-
-    return {
-        "delays": delays,
-        "predictions": predictions,
-        "prefixes": prefixes,
-        "truths_ground": truths_ground,
-    }
-
-
-def run_experiment_translation(
-    policy: ACTSmoothPolicy,
-    preprocessor,
-    postprocessor,
-    sample: dict,
-    max_delay: int,
-    chunk_size: int,
-    n_translations: int,
-    max_translation: float,
-    device: torch.device,
-) -> dict:
-    """Run translation experiment for a single observation.
-
-    Uses max_delay as the fixed delay and varies the prefix offset.
-
-    Args:
-        policy: Policy instance.
-        preprocessor: Preprocessor pipeline.
-        postprocessor: Postprocessor pipeline for unnormalization.
-        sample: Dataset sample.
-        max_delay: Maximum delay (used as fixed delay).
-        chunk_size: Action chunk size.
-        n_translations: Number of translation levels.
-        max_translation: Maximum translation offset.
-        device: Device to use.
-
-    Returns:
-        Dictionary with offsets, predictions, prefixes, and ground truth.
-    """
-    offsets = np.linspace(-max_translation, max_translation, n_translations).tolist()
-    predictions = []
-    prefixes = []
-    delay = max_delay
-
-    actions_all = sample["action"]  # [max_delay + chunk_size, action_dim]
-    truth_ground = actions_all[delay : delay + chunk_size].cpu().numpy()
-
-    for offset in offsets:
-        action_prefix = compute_prefix(sample, delay, device, offset=offset)
-
-        prefix_absolute = actions_all[:delay].cpu().numpy()
-        offsets_proportional = np.linspace(1.0 / delay, 1.0, delay).reshape(-1, 1)
-        prefix_with_offset = prefix_absolute + offset * offsets_proportional
-        prefixes.append(prefix_with_offset)
-
-        pred = predict_with_prefix(policy, preprocessor, postprocessor, sample, device, action_prefix)
-        predictions.append(pred)
-
-    return {
-        "offsets": offsets,
-        "predictions": predictions,
-        "prefixes": prefixes,
-        "truth_ground": truth_ground,
-    }
-
-
-# ============================================================================
-# DataFrame Building
-# ============================================================================
-
-
-def build_dataframe_experiments(
-    indices_obs: list[int],
-    results_delay: list[dict],
-    results_translation: list[dict],
-    samples: list[dict],
-    max_delay: int,
-    chunk_size: int,
-    idx_joint: int,
-    fps: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Transform experiment results into tidy DataFrames for plotnine.
-
-    Args:
-        indices_obs: List of observation indices.
-        results_delay: List of delay experiment results.
-        results_translation: List of translation experiment results.
-        samples: List of dataset samples.
-        max_delay: Maximum delay.
-        chunk_size: Action chunk size.
-        idx_joint: Which joint to plot.
-        fps: Dataset FPS.
-
-    Returns:
-        Tuple of (df_delay, df_truth_delay, df_trans, df_truth_trans).
-    """
-    rows_delay = []
-    rows_truth_delay = []
-    rows_trans = []
-    rows_truth_trans = []
-
-    for idx_row, (idx_obs, sample, res_delay, res_trans) in enumerate(
-        zip(indices_obs, samples, results_delay, results_translation)
-    ):
-        state_t = sample["observation.state"]
-        if state_t.dim() > 1:
-            state_t = state_t.squeeze(0)
-        value_state = state_t[idx_joint].item()
-
-        # Delay experiment
-        for delay, pred, truth in zip(res_delay["delays"], res_delay["predictions"], res_delay["truths_ground"]):
-            time_axis = np.arange(chunk_size) / fps + delay / fps
-
-            for t, val in zip(time_axis, pred[:, idx_joint]):
-                rows_delay.append(
-                    {
-                        "idx_obs": idx_obs,
-                        "delay": delay,
-                        "time_s": t,
-                        "value_position": val,
-                        "value_state": value_state,
-                    }
-                )
-
-            for t, val in zip(time_axis, truth[:, idx_joint]):
-                rows_truth_delay.append(
-                    {
-                        "idx_obs": idx_obs,
-                        "delay": delay,
-                        "time_s": t,
-                        "value_position": val,
-                    }
-                )
-
-        # Translation experiment
-        truth = res_trans["truth_ground"]
-        time_axis = np.arange(chunk_size) / fps + max_delay / fps
-
-        for t, val in zip(time_axis, truth[:, idx_joint]):
-            rows_truth_trans.append(
-                {
-                    "idx_obs": idx_obs,
-                    "time_s": t,
-                    "value_position": val,
-                    "value_state": value_state,
-                }
-            )
-
-        for offset, pred, prefix in zip(res_trans["offsets"], res_trans["predictions"], res_trans["prefixes"]):
-            for t, val in zip(time_axis, pred[:, idx_joint]):
-                rows_trans.append(
-                    {
-                        "idx_obs": idx_obs,
-                        "offset": offset,
-                        "time_s": t,
-                        "value_position": val,
-                        "value_state": value_state,
-                        "is_prefix": False,
-                    }
-                )
-
-            # Add prefix points
-            time_prefix = np.arange(0, max_delay) / fps
-            for t, val in zip(time_prefix, prefix[:, idx_joint]):
-                rows_trans.append(
-                    {
-                        "idx_obs": idx_obs,
-                        "offset": offset,
-                        "time_s": t,
-                        "value_position": val,
-                        "value_state": value_state,
-                        "is_prefix": True,
-                    }
-                )
-
-    return (
-        pd.DataFrame(rows_delay),
-        pd.DataFrame(rows_truth_delay),
-        pd.DataFrame(rows_trans),
-        pd.DataFrame(rows_truth_trans),
-    )
-
-
-# ============================================================================
-# Plotting
-# ============================================================================
-
-
-def create_plot(
-    df_delay: pd.DataFrame,
-    df_truth_delay: pd.DataFrame,
-    df_trans: pd.DataFrame,
-    df_truth_trans: pd.DataFrame,
-    idx_joint: int,
-    max_delay: int,
-    path_output: Path,
-) -> None:
-    """Create and save the delay sensitivity plot using plotnine.
-
-    Args:
-        df_delay: DataFrame with delay experiment predictions.
-        df_truth_delay: DataFrame with delay experiment ground truth.
-        df_trans: DataFrame with translation experiment data.
-        df_truth_trans: DataFrame with translation experiment ground truth.
-        idx_joint: Which joint was plotted.
-        max_delay: Maximum delay value.
-        path_output: Path to save the plot.
-    """
-    # Get unique observations for state points
-    df_state = df_delay[["idx_obs", "value_state"]].drop_duplicates()
-    df_state["time_s"] = 0
-
-    # Delay experiment plot
-    plot_delay = (
-        ggplot()
-        + geom_line(
-            data=df_truth_delay[df_truth_delay["delay"] == 0],
-            mapping=aes(x="time_s", y="value_position"),
-            linetype="dashed",
-            color="black",
-            alpha=0.6,
-            size=0.8,
-        )
-        + geom_line(
-            data=df_delay,
-            mapping=aes(x="time_s", y="value_position", color="factor(delay)", group="delay"),
-            size=0.6,
-            alpha=0.8,
-        )
-        + geom_point(data=df_state, mapping=aes(x="time_s", y="value_state"), size=3, color="black")
-        + facet_wrap("~idx_obs", ncol=1, scales="free_y")
-        + scale_color_cmap("viridis")
-        + labs(x="Time from observation (s)", y=f"Joint {idx_joint} (rad)", color="Delay")
-        + ggtitle("Delay Experiment")
-        + theme_publication()
-    )
-
-    # Translation experiment plot
-    df_trans_pred = df_trans[~df_trans["is_prefix"]]
-    df_trans_prefix = df_trans[df_trans["is_prefix"]]
-
-    plot_trans = (
-        ggplot()
-        + geom_line(
-            data=df_truth_trans,
-            mapping=aes(x="time_s", y="value_position"),
-            linetype="dashed",
-            color="black",
-            alpha=0.6,
-            size=0.8,
-        )
-        + geom_line(
-            data=df_trans_pred,
-            mapping=aes(x="time_s", y="value_position", color="offset", group="offset"),
-            size=0.6,
-            alpha=0.8,
-        )
-        + geom_line(
-            data=df_trans_prefix,
-            mapping=aes(x="time_s", y="value_position", color="offset", group="offset"),
-            linetype="dotted",
-            size=0.6,
-            alpha=0.6,
-        )
-        + geom_point(data=df_state, mapping=aes(x="time_s", y="value_state"), size=3, color="black")
-        + facet_wrap("~idx_obs", ncol=1, scales="free_y")
-        + scale_color_gradient2(low="blue", mid="gray", high="red", midpoint=0)
-        + labs(x="Time from observation (s)", y=f"Joint {idx_joint} (rad)", color="Offset")
-        + ggtitle(f"Translation Experiment (delay={max_delay})")
-        + theme_publication()
-    )
-
-    # Save both plots
-    n_obs = df_delay["idx_obs"].nunique()
-    height_per_obs = 3
-    height = n_obs * height_per_obs + 1
-
-    path_delay = path_output.parent / f"{path_output.stem}_delay{path_output.suffix}"
-    path_trans = path_output.parent / f"{path_output.stem}_translation{path_output.suffix}"
-
-    save_plot(plot_delay, path_delay, width=8, height=height)
-    save_plot(plot_trans, path_trans, width=8, height=height)
-
-    logging.info(f"Saved delay plot to {path_delay}")
-    logging.info(f"Saved translation plot to {path_trans}")
 
 
 # ============================================================================
@@ -613,18 +209,13 @@ def create_plot(
 
 @draccus.wrap()
 def main(cfg: ConfigDelaySensitivity):
-    """Main entry point for delay sensitivity plotting."""
     init_logging()
 
     logging.info(f"Setting seed: {cfg.seed}")
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    if cfg.device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(cfg.device)
-
+    device = torch.device(cfg.device) if cfg.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
 
     logging.info(f"Loading policy from {cfg.path_policy}")
@@ -632,9 +223,10 @@ def main(cfg: ConfigDelaySensitivity):
     policy.to(device)
     policy.eval()
 
-    max_delay = policy.config.max_delay
-    chunk_size = policy.config.chunk_size
-    logging.info(f"Policy config: max_delay={max_delay}, chunk_size={chunk_size}")
+    K = policy.config.length_prefix_past  # past prefix length
+    D = policy.config.length_prefix_future  # max future prefix / delay
+    C = policy.config.chunk_size
+    logging.info(f"Policy config: length_prefix_past={K}, length_prefix_future={D}, chunk_size={C}")
 
     overrides_device = {"device_processor": {"device": str(device)}}
     preprocessor, postprocessor = make_pre_post_processors(
@@ -654,81 +246,340 @@ def main(cfg: ConfigDelaySensitivity):
     idx_to = int(idx_to.item() if hasattr(idx_to, "item") else idx_to)
     logging.info(f"Episode {cfg.idx_episode}: indices [{idx_from}, {idx_to})")
 
-    logging.info("Loading dataset with extended delta_timestamps")
     dataset = load_dataset_for_episode(
-        cfg.id_repo_dataset,
-        cfg.idx_episode,
-        max_delay,
-        chunk_size,
-        fps,
-        cfg.backend_video,
-        meta_dataset,
+        cfg.id_repo_dataset, cfg.idx_episode, K, D, C, fps, cfg.backend_video, meta_dataset
     )
 
+    # Sample or parse observation indices
     if cfg.indices_observation:
         indices_obs = [int(x.strip()) for x in cfg.indices_observation.split(",")]
-        logging.info(f"Using explicit observation indices: {indices_obs}")
     else:
-        logging.info(f"Sampling {cfg.n_observations} observations")
-        indices_obs = sample_indices_observation(
-            idx_from,
-            idx_to,
-            max_delay,
-            chunk_size,
-            cfg.n_observations,
-            cfg.seed,
+        # Valid range: enough room for past actions and future actions + target
+        idx_valid_from = idx_from + K
+        idx_valid_to = idx_to - D - C
+        if idx_valid_to <= idx_valid_from:
+            raise ValueError(f"Episode too short: valid range [{idx_valid_from}, {idx_valid_to}) is empty")
+        rng = np.random.RandomState(cfg.seed)
+        indices_obs = sorted(
+            rng.choice(
+                range(idx_valid_from, idx_valid_to),
+                size=min(cfg.n_observations, idx_valid_to - idx_valid_from),
+                replace=False,
+            ).tolist()
         )
-        logging.info(f"Sampled indices: {indices_obs}")
+    logging.info(f"Observation indices: {indices_obs}")
 
-    logging.info("Running experiments...")
-    results_delay = []
-    results_translation = []
-    samples = []
+    # ------------------------------------------------------------------
+    # Run all experiments, building DataFrame rows directly
+    # ------------------------------------------------------------------
+    rows_pred = []
+    rows_truth = []
+
+    offsets_translation = np.linspace(-cfg.max_translation, cfg.max_translation, cfg.n_translations).tolist()
 
     for idx_obs in indices_obs:
         logging.info(f"  Processing observation {idx_obs}")
         sample = dataset[idx_obs]
-        samples.append(sample)
+        actions_all = sample["action"]  # [K + D + C, action_dim]
 
-        res_delay = run_experiment_delay(policy, preprocessor, postprocessor, sample, max_delay, chunk_size, device)
-        results_delay.append(res_delay)
+        state_t = sample["observation.state"]
+        if state_t.dim() > 1:
+            state_t = state_t.squeeze(0)
+        value_state = state_t[cfg.idx_joint].item()
 
-        res_trans = run_experiment_translation(
-            policy,
-            preprocessor,
-            postprocessor,
-            sample,
-            max_delay,
-            chunk_size,
-            cfg.n_translations,
-            cfg.max_translation,
-            device,
-        )
-        results_translation.append(res_trans)
+        def add_prediction(
+            experiment: str,
+            condition,
+            pred: np.ndarray,
+            delay: int,
+            prefix_future=None,
+            prefix_past=None,
+        ):
+            """Append prediction and prefix rows for one condition."""
+            # Prediction: C points starting at delay/fps
+            time_pred = np.arange(C) / fps + delay / fps
+            for t, val in zip(time_pred, pred[:, cfg.idx_joint]):
+                rows_pred.append(
+                    {
+                        "idx_obs": idx_obs,
+                        "experiment": experiment,
+                        "condition": condition,
+                        "time_s": t,
+                        "value_position": float(val),
+                        "value_state": value_state,
+                        "line_type": "prediction",
+                    }
+                )
 
-    logging.info("Building DataFrames...")
-    df_delay, df_truth_delay, df_trans, df_truth_trans = build_dataframe_experiments(
-        indices_obs,
-        results_delay,
-        results_translation,
-        samples,
-        max_delay,
-        chunk_size,
-        cfg.idx_joint,
-        fps,
-    )
+            # Future prefix at [0, 1/fps, ..., (delay-1)/fps] + bridge to first prediction
+            if prefix_future is not None:
+                time_pf = np.arange(len(prefix_future)) / fps
+                for t, val in zip(time_pf, prefix_future[:, cfg.idx_joint]):
+                    rows_pred.append(
+                        {
+                            "idx_obs": idx_obs,
+                            "experiment": experiment,
+                            "condition": condition,
+                            "time_s": t,
+                            "value_position": float(val),
+                            "value_state": value_state,
+                            "line_type": "prefix_future",
+                        }
+                    )
+                # Bridge: connect last prefix point to first prediction point
+                rows_pred.append(
+                    {
+                        "idx_obs": idx_obs,
+                        "experiment": experiment,
+                        "condition": condition,
+                        "time_s": delay / fps,
+                        "value_position": float(pred[0, cfg.idx_joint]),
+                        "value_state": value_state,
+                        "line_type": "prefix_future",
+                    }
+                )
 
-    path_output = Path(cfg.path_output)
+            # Past prefix at [-n/fps, ..., -1/fps] + bridge to first future prefix
+            if prefix_past is not None and len(prefix_past) > 0:
+                n_pp = len(prefix_past)
+                time_pp = np.arange(-n_pp, 0) / fps
+                for t, val in zip(time_pp, prefix_past[:, cfg.idx_joint]):
+                    rows_pred.append(
+                        {
+                            "idx_obs": idx_obs,
+                            "experiment": experiment,
+                            "condition": condition,
+                            "time_s": t,
+                            "value_position": float(val),
+                            "value_state": value_state,
+                            "line_type": "prefix_past",
+                        }
+                    )
+                # Bridge: connect last past prefix to first future prefix (or prediction start)
+                if prefix_future is not None and len(prefix_future) > 0:
+                    bridge_val = float(prefix_future[0, cfg.idx_joint])
+                else:
+                    bridge_val = float(pred[0, cfg.idx_joint])
+                rows_pred.append(
+                    {
+                        "idx_obs": idx_obs,
+                        "experiment": experiment,
+                        "condition": condition,
+                        "time_s": 0.0,
+                        "value_position": bridge_val,
+                        "value_state": value_state,
+                        "line_type": "prefix_past",
+                    }
+                )
+
+        # Reference ground truth from t=-K (shared across all plots)
+        truth_ref = actions_all[0 : K + D + C].cpu().numpy()
+        time_ref = np.arange(-K, D + C) / fps
+        for t, val in zip(time_ref, truth_ref[:, cfg.idx_joint]):
+            rows_truth.append({"idx_obs": idx_obs, "time_s": t, "value_position": float(val)})
+
+        prefix_past_gt = actions_all[0:K].cpu().numpy() if K > 0 else None
+
+        # --- Experiment 1: Sensitivity (vary future prefix length) ---
+        for delay in range(1, D + 1):
+            pred = predict_for_condition(policy, preprocessor, postprocessor, sample, device, K, delay, K)
+            prefix_future_vis = actions_all[K : K + delay].cpu().numpy()
+            add_prediction(
+                "sensitivity", delay, pred, delay, prefix_future=prefix_future_vis, prefix_past=prefix_past_gt
+            )
+
+        # --- Experiment 2: Future prefix translation ---
+        for offset in offsets_translation:
+            pred = predict_for_condition(
+                policy, preprocessor, postprocessor, sample, device, K, D, K, offset_future=offset
+            )
+            prefix_future_vis = actions_all[K : K + D].cpu().numpy() + offset
+            add_prediction(
+                "translation_future", offset, pred, D, prefix_future=prefix_future_vis, prefix_past=prefix_past_gt
+            )
+
+        # --- Experiment 3: Past prefix translation (offset both past and future together) ---
+        if K > 0:
+            for offset in offsets_translation:
+                pred = predict_for_condition(
+                    policy,
+                    preprocessor,
+                    postprocessor,
+                    sample,
+                    device,
+                    K,
+                    D,
+                    K,
+                    offset_past=offset,
+                    offset_future=offset,
+                )
+                prefix_past_vis = actions_all[0:K].cpu().numpy() + offset
+                prefix_future_vis = actions_all[K : K + D].cpu().numpy() + offset
+                add_prediction(
+                    "translation_past",
+                    offset,
+                    pred,
+                    D,
+                    prefix_future=prefix_future_vis,
+                    prefix_past=prefix_past_vis,
+                )
+
+    df_pred = pd.DataFrame(rows_pred)
+    df_truth = pd.DataFrame(rows_truth)
+
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
     logging.info("Creating plots...")
-    create_plot(
-        df_delay,
-        df_truth_delay,
-        df_trans,
-        df_truth_trans,
-        cfg.idx_joint,
-        max_delay,
-        path_output,
+    path_output = Path(cfg.path_output)
+
+    # State points at t=0
+    df_state = df_pred[["idx_obs", "value_state"]].drop_duplicates()
+    df_state["time_s"] = 0.0
+
+    n_obs = df_pred["idx_obs"].nunique()
+    height = n_obs * 3 + 1
+
+    # Qualitative color helper for discrete experiments
+    tab10_colors = mpl_colormaps["tab10"].colors
+
+    def colors_qualitative(n: int) -> list[str]:
+        """Return n distinct qualitative colors from tab10."""
+        return [to_hex(tab10_colors[i]) for i in range(n)]
+
+    # --- Sensitivity plot (vary future prefix length) ---
+    dp = df_pred[df_pred["experiment"] == "sensitivity"].copy()
+    dp["condition"] = dp["condition"].astype(int)
+    dp_pred = dp[dp["line_type"] == "prediction"]
+    dp_pf = dp[dp["line_type"] == "prefix_future"]
+    dp_pp = dp[dp["line_type"] == "prefix_past"].drop_duplicates(subset=["idx_obs", "time_s", "value_position"])
+    colors_delay = colors_qualitative(dp_pred["condition"].nunique())
+
+    plot_sensitivity = (
+        ggplot()
+        + geom_line(df_truth, aes("time_s", "value_position"), linetype="dashed", color="black", alpha=0.6, size=0.8)
+        + geom_point(dp_pp, aes("time_s", "value_position"), color="gray", size=2, alpha=0.7, show_legend=False)
+        + geom_line(
+            dp_pf,
+            aes("time_s", "value_position", color="factor(condition)", group="condition"),
+            linetype="dotted",
+            size=0.8,
+            alpha=0.7,
+            show_legend=False,
+        )
+        + geom_point(
+            dp_pf,
+            aes("time_s", "value_position", color="factor(condition)"),
+            size=2,
+            alpha=0.7,
+            show_legend=False,
+        )
+        + geom_line(
+            dp_pred,
+            aes("time_s", "value_position", color="factor(condition)", group="condition"),
+            size=0.6,
+            alpha=0.8,
+        )
+        + geom_point(df_state, aes("time_s", "value_state"), size=3, color="black")
+        + facet_wrap("~idx_obs", ncol=1, scales="free_y")
+        + scale_color_manual(values=colors_delay)
+        + labs(x="Time from observation (s)", y=f"Joint {cfg.idx_joint}", color="Delay")
+        + ggtitle("Sensitivity to Future Prefix Length (dotted=prefix)")
+        + theme_publication()
     )
+    path_sensitivity = path_output.parent / f"{path_output.stem}_sensitivity{path_output.suffix}"
+    save_plot(plot_sensitivity, path_sensitivity, width=8, height=height)
+    logging.info(f"Saved {path_sensitivity}")
+
+    # --- Future translation plot ---
+    tp = df_pred[df_pred["experiment"] == "translation_future"]
+    tp_pred = tp[tp["line_type"] == "prediction"]
+    # Combine past + future prefix into one connected line per condition
+    tp_prefix = tp[tp["line_type"].isin(["prefix_past", "prefix_future"])]
+
+    plot_trans_future = (
+        ggplot()
+        + geom_line(df_truth, aes("time_s", "value_position"), linetype="dashed", color="black", alpha=0.6, size=0.8)
+        + geom_line(
+            tp_prefix,
+            aes("time_s", "value_position", color="condition", group="condition"),
+            linetype="dotted",
+            size=0.6,
+            alpha=0.6,
+            show_legend=False,
+        )
+        + geom_point(
+            tp_prefix,
+            aes("time_s", "value_position", color="condition"),
+            size=2,
+            alpha=0.7,
+            show_legend=False,
+        )
+        + geom_line(
+            tp_pred,
+            aes("time_s", "value_position", color="condition", group="condition"),
+            size=0.6,
+            alpha=0.8,
+        )
+        + geom_point(df_state, aes("time_s", "value_state"), size=3, color="black")
+        + facet_wrap("~idx_obs", ncol=1, scales="free_y")
+        + scale_color_gradient2(low="blue", mid="gray", high="red", midpoint=0)
+        + labs(x="Time from observation (s)", y=f"Joint {cfg.idx_joint}", color="Offset")
+        + ggtitle(f"Future Prefix Translation (delay={D})")
+        + theme_publication()
+    )
+    path_trans_future = path_output.parent / f"{path_output.stem}_translation_future{path_output.suffix}"
+    save_plot(plot_trans_future, path_trans_future, width=8, height=height)
+    logging.info(f"Saved {path_trans_future}")
+
+    # --- Past translation plot ---
+    if K > 0:
+        tp2 = df_pred[df_pred["experiment"] == "translation_past"]
+        tp2_pred = tp2[tp2["line_type"] == "prediction"]
+        # Combine past + future prefix into one connected line per condition
+        tp2_prefix = tp2[tp2["line_type"].isin(["prefix_past", "prefix_future"])]
+
+        plot_trans_past = (
+            ggplot()
+            + geom_line(
+                df_truth,
+                aes("time_s", "value_position"),
+                linetype="dashed",
+                color="black",
+                alpha=0.6,
+                size=0.8,
+            )
+            + geom_line(
+                tp2_prefix,
+                aes("time_s", "value_position", color="condition", group="condition"),
+                linetype="dotted",
+                size=0.6,
+                alpha=0.6,
+                show_legend=False,
+            )
+            + geom_point(
+                tp2_prefix,
+                aes("time_s", "value_position", color="condition"),
+                size=2,
+                alpha=0.7,
+                show_legend=False,
+            )
+            + geom_line(
+                tp2_pred,
+                aes("time_s", "value_position", color="condition", group="condition"),
+                size=0.6,
+                alpha=0.8,
+            )
+            + geom_point(df_state, aes("time_s", "value_state"), size=3, color="black")
+            + facet_wrap("~idx_obs", ncol=1, scales="free_y")
+            + scale_color_gradient2(low="blue", mid="gray", high="red", midpoint=0)
+            + labs(x="Time from observation (s)", y=f"Joint {cfg.idx_joint}", color="Offset")
+            + ggtitle(f"Past Prefix Translation (delay={D})")
+            + theme_publication()
+        )
+        path_trans_past = path_output.parent / f"{path_output.stem}_translation_past{path_output.suffix}"
+        save_plot(plot_trans_past, path_trans_past, width=8, height=height)
+        logging.info(f"Saved {path_trans_past}")
 
     logging.info("Done!")
 

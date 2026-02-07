@@ -161,13 +161,25 @@ def build_dataframe_observations(
                         }
                     )
 
-    return pd.DataFrame(rows)
+    df_result = pd.DataFrame(rows)
+
+    if not df_result.empty:
+        # Drop forward-filled duplicates to avoid staircase artifacts.
+        # fill_latest_at() propagates the last observation value to every frame,
+        # so consecutive rows with the same value are not real observations.
+        df_result = df_result.sort_values(["name_motor", "idx_frame"])
+        shifted = df_result.groupby("name_motor")["value_position"].shift()
+        mask_changed = df_result["value_position"] != shifted
+        df_result = df_result[mask_changed].reset_index(drop=True)
+
+    return df_result
 
 
 def build_dataframe_actions(
     df: pd.DataFrame,
     names_motor: list[str],
     name_index: str,
+    only_control_frames: bool = False,
 ) -> pd.DataFrame:
     """Build tidy DataFrame for actions.
 
@@ -175,26 +187,30 @@ def build_dataframe_actions(
         df: Raw DataFrame from rerun.
         names_motor: List of motor names.
         name_index: Index column name.
+        only_control_frames: If True, only include actions at control frames (policy timesteps).
+            If False, include all frames (showing interpolated commands).
 
     Returns:
         Tidy DataFrame with columns: idx_frame, name_motor, value_position.
     """
     rows = []
 
-    # Extract timestep values to identify control frames
-    col_timestep = "/timestep:Scalars:scalars"
-    has_timestep = col_timestep in df.columns
+    # Optionally filter to control frames only
+    indices_control_frame = None
+    if only_control_frames:
+        col_timestep = "/timestep:Scalars:scalars"
+        has_timestep = col_timestep in df.columns
 
-    if has_timestep:
-        vals_timestep = df[col_timestep].apply(extract_scalar_from_rerun).values
-        # Find first frame for each unique timestep
-        vals_unique, indices_first = np.unique(vals_timestep[~pd.isna(vals_timestep)], return_index=True)
-        indices_control_frame = set(indices_first)
-    else:
-        indices_control_frame = set(range(len(df)))
+        if has_timestep:
+            vals_timestep = df[col_timestep].apply(extract_scalar_from_rerun).values
+            # Find first frame for each unique timestep
+            vals_unique, indices_first = np.unique(vals_timestep[~pd.isna(vals_timestep)], return_index=True)
+            indices_control_frame = set(indices_first)
+        else:
+            indices_control_frame = set(range(len(df)))
 
     for idx_frame, row in df.iterrows():
-        if idx_frame not in indices_control_frame:
+        if indices_control_frame is not None and idx_frame not in indices_control_frame:
             continue
 
         for name_motor in names_motor:
@@ -210,7 +226,18 @@ def build_dataframe_actions(
                         }
                     )
 
-    return pd.DataFrame(rows)
+    df_result = pd.DataFrame(rows)
+
+    if not only_control_frames and not df_result.empty:
+        # Drop forward-filled duplicates to avoid staircase artifacts.
+        # fill_latest_at() propagates the last value to every frame,
+        # so consecutive rows with the same value are not real logged actions.
+        df_result = df_result.sort_values(["name_motor", "idx_frame"])
+        shifted = df_result.groupby("name_motor")["value_position"].shift()
+        mask_changed = df_result["value_position"] != shifted
+        df_result = df_result[mask_changed].reset_index(drop=True)
+
+    return df_result
 
 
 def extract_indices_chunk_switch(df: pd.DataFrame, name_index: str) -> list[int]:
@@ -254,16 +281,23 @@ def extract_indices_chunk_switch(df: pd.DataFrame, name_index: str) -> list[int]
 
 def create_plot(
     df_obs: pd.DataFrame,
-    df_action: pd.DataFrame,
+    df_action_commanded: pd.DataFrame,
+    df_action_policy: pd.DataFrame,
     indices_chunk: list[int],
     faceted: bool,
     path_output: Path,
 ) -> None:
     """Create and save the rerun visualization plot.
 
+    Shows three layers per motor:
+    - Solid line: observations (actual robot state)
+    - Dashed line: commanded actions (including interpolated frames)
+    - Dots: policy actions (at control frames only)
+
     Args:
-        df_obs: DataFrame with observations.
-        df_action: DataFrame with actions.
+        df_obs: DataFrame with observations (all frames).
+        df_action_commanded: DataFrame with commanded actions (all frames, including interpolated).
+        df_action_policy: DataFrame with policy actions (control frames only).
         indices_chunk: List of frame indices where chunks switch.
         faceted: Whether to facet by motor.
         path_output: Path to save the plot.
@@ -286,65 +320,52 @@ def create_plot(
     names_motor = sorted(df_obs["name_motor"].unique())
     color_mapping = {name: colors[i % len(colors)] for i, name in enumerate(names_motor)}
 
+    layers_common = [
+        geom_line(
+            data=df_obs,
+            mapping=aes(x="idx_frame", y="value_position", color="name_motor"),
+            size=0.5,
+            alpha=0.7,
+        ),
+        geom_line(
+            data=df_action_commanded,
+            mapping=aes(x="idx_frame", y="value_position", color="name_motor"),
+            size=0.4,
+            alpha=0.5,
+            linetype="dashed",
+        ),
+        geom_point(
+            data=df_action_policy,
+            mapping=aes(x="idx_frame", y="value_position", color="name_motor"),
+            size=1.5,
+            alpha=0.4,
+        ),
+        geom_vline(
+            data=df_chunk,
+            mapping=aes(xintercept="idx_frame"),
+            linetype="dashed",
+            color="gray",
+            alpha=0.5,
+            size=0.5,
+        ),
+        scale_color_manual(values=color_mapping),
+        labs(x="Frame index", y="Position (rad)", color="Motor"),
+        ggtitle("Obs (solid), Commands (dashed), Policy actions (dots)"),
+        theme_publication(),
+    ]
+
     if faceted:
-        plot = (
-            ggplot()
-            + geom_line(
-                data=df_obs,
-                mapping=aes(x="idx_frame", y="value_position", color="name_motor"),
-                size=0.5,
-                alpha=0.7,
-            )
-            + geom_point(
-                data=df_action,
-                mapping=aes(x="idx_frame", y="value_position", color="name_motor"),
-                size=1.5,
-            )
-            + geom_vline(
-                data=df_chunk,
-                mapping=aes(xintercept="idx_frame"),
-                linetype="dashed",
-                color="gray",
-                alpha=0.5,
-                size=0.5,
-            )
-            + facet_wrap("~name_motor", ncol=2, scales="free_y")
-            + scale_color_manual(values=color_mapping)
-            + labs(x="Frame index", y="Position (rad)", color="Motor")
-            + ggtitle("Observations (lines) and Actions (dots)")
-            + theme_publication()
-        )
+        plot = ggplot() + facet_wrap("~name_motor", ncol=2, scales="free_y")
+        for layer in layers_common:
+            plot = plot + layer
 
         n_rows = (n_motors + 1) // 2
         height = n_rows * 3 + 1
         width = 14
     else:
-        plot = (
-            ggplot()
-            + geom_line(
-                data=df_obs,
-                mapping=aes(x="idx_frame", y="value_position", color="name_motor"),
-                size=0.5,
-                alpha=0.7,
-            )
-            + geom_point(
-                data=df_action,
-                mapping=aes(x="idx_frame", y="value_position", color="name_motor"),
-                size=1.5,
-            )
-            + geom_vline(
-                data=df_chunk,
-                mapping=aes(xintercept="idx_frame"),
-                linetype="dashed",
-                color="gray",
-                alpha=0.5,
-                size=0.5,
-            )
-            + scale_color_manual(values=color_mapping)
-            + labs(x="Frame index", y="Position (rad)", color="Motor")
-            + ggtitle("Observations (lines) and Actions (dots)")
-            + theme_publication()
-        )
+        plot = ggplot()
+        for layer in layers_common:
+            plot = plot + layer
 
         height = 8
         width = 14
@@ -382,15 +403,16 @@ def main(cfg: ConfigRerunPlot):
     df_obs = build_dataframe_observations(df, names_motor, name_index)
     logging.info(f"  {len(df_obs)} observation rows")
 
-    logging.info("Building action DataFrame...")
-    df_action = build_dataframe_actions(df, names_motor, name_index)
-    logging.info(f"  {len(df_action)} action rows")
+    logging.info("Building action DataFrames...")
+    df_action_commanded = build_dataframe_actions(df, names_motor, name_index, only_control_frames=False)
+    df_action_policy = build_dataframe_actions(df, names_motor, name_index, only_control_frames=True)
+    logging.info(f"  {len(df_action_commanded)} commanded action rows, {len(df_action_policy)} policy action rows")
 
     indices_chunk = extract_indices_chunk_switch(df, name_index)
 
     path_output = Path(cfg.path_output)
     logging.info("Creating plot...")
-    create_plot(df_obs, df_action, indices_chunk, cfg.faceted, path_output)
+    create_plot(df_obs, df_action_commanded, df_action_policy, indices_chunk, cfg.faceted, path_output)
 
     logging.info("Done!")
 

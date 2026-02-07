@@ -28,7 +28,7 @@ LeRobot is installed from a **pinned git commit** (not PyPI) because the latest 
 IMPORTANT: When you need to understand how LeRobot works internally, explore its source files in
 
 ```
-.venv/lib/python3.10/site-packages/lerobot/
+.venv/lib/python3.11/site-packages/lerobot/
 ```
 
 ## Code Naming
@@ -51,9 +51,8 @@ Follow a noun-first approach for variables and constants, for example `idChat` i
 
 **Exception: Library Interface Consistency**
 
-When interfacing with external libraries (e.g., LeRobot, PyTorch, ACTRelativeRTC), preserve the library's naming conventions for:
+When interfacing with external libraries (e.g., LeRobot, PyTorch), preserve the library's naming conventions for:
 
-- Function parameters that match library APIs (e.g., `delay`, `action_prefix` for ACTRelativeRTC)
 - Dict keys that follow library conventions (e.g., `observation.state`, `observation.images.*` for LeRobot)
 - Variables passed directly to library functions (e.g., `robot_action` for `robot.send_action()`)
 - Standard framework naming (e.g., `device` for PyTorch, `policy`, `preprocessor` for LeRobot)

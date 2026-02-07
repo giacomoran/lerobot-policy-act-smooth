@@ -11,13 +11,17 @@ set -e
 DIR_BASE="/workspace"
 
 # --- 10fps dataset ---
+# length_prefix_future=2: needed for interpolation at 30fps.
+#   t_0 is at the observation timestep (already executing), so only d-1 actions
+#   absorb inference latency. With d=2: (2-1)/10 = 100ms > ~35ms inference latency.
+#   d=1 would leave no interpolation target while inference runs.
 echo "=== Training on lerobot_policy_act_smooth_10fps ==="
 
 lerobot-train \
     --policy.type=act_smooth \
     --dataset.repo_id=giacomoran/lerobot_policy_act_smooth_10fps \
-    --policy.repo_id=giacomoran/lerobot_policy_act_smooth_10fps_smooth_p1f1 \
-    --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_p1f1" \
+    --policy.repo_id=giacomoran/lerobot_policy_act_smooth_10fps_smooth_p1f2 \
+    --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_p1f2" \
     --policy.input_features='{"observation.state": {"shape": [6], "type": "STATE"}, "observation.images.wrist": {"shape": [3, 640, 480], "type": "VISUAL"}, "observation.images.top": {"shape": [3, 480, 640], "type": "VISUAL"}}' \
     --steps=30000 \
     --save_freq=10000 \
@@ -27,8 +31,8 @@ lerobot-train \
     --policy.chunk_size=10 \
     --policy.n_action_steps=10 \
     --policy.use_vae=false \
-    --policy.prefix_length_past=1 \
-    --policy.prefix_length_future=1 \
+    --policy.length_prefix_past=1 \
+    --policy.length_prefix_future=2 \
     --policy.device=cuda \
     --wandb.enable=true \
     --wandb.disable_artifact=true \
@@ -39,12 +43,15 @@ echo "=== Resuming 10fps to add extra checkpoints ==="
 
 lerobot-train \
     --resume=true \
-    --config_path="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_p1f1/checkpoints/030000/pretrained_model/train_config.json" \
-    --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_p1f1" \
+    --config_path="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_p1f2/checkpoints/030000/pretrained_model/train_config.json" \
+    --output_dir="${DIR_BASE}/lerobot_policy_act_smooth_10fps_smooth_p1f2" \
     --steps=30003 \
     --save_freq=1
 
 # --- 30fps dataset ---
+# length_prefix_future=2: sufficient without interpolation (already at 30fps).
+#   With d=2: (2-1)/30 = 33ms, close to ~35ms inference latency but OK since
+#   no interpolation is needed at native fps.
 echo "=== Training on lerobot_policy_act_smooth_30fps ==="
 
 lerobot-train \
@@ -61,8 +68,8 @@ lerobot-train \
     --policy.chunk_size=30 \
     --policy.n_action_steps=30 \
     --policy.use_vae=false \
-    --policy.prefix_length_past=4 \
-    --policy.prefix_length_future=2 \
+    --policy.length_prefix_past=4 \
+    --policy.length_prefix_future=2 \
     --policy.device=cuda \
     --wandb.enable=true \
     --wandb.disable_artifact=true \
@@ -87,7 +94,7 @@ echo "=== Training complete ==="
 echo "=== Compressing outputs ==="
 cd "${DIR_BASE}"
 
-DIRS_OUTPUT="lerobot_policy_act_smooth_10fps_smooth_p1f1 lerobot_policy_act_smooth_30fps_smooth_p4f2"
+DIRS_OUTPUT="lerobot_policy_act_smooth_10fps_smooth_p1f2 lerobot_policy_act_smooth_30fps_smooth_p4f2"
 ARGS_TAR=""
 
 for DIR in ${DIRS_OUTPUT}; do

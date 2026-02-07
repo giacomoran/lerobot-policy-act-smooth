@@ -3,10 +3,14 @@
 # Run policy evaluation with the SO101 follower arm.
 #
 # Usage:
-#   ./eval.sh --variant_eval=sync --fps_policy=10 --variant_policy=vanilla
+#   ./eval.sh --variant_eval=sync --fps_policy=10 --variant_policy=smooth
 #   ./eval.sh --variant_eval=sync_discard --fps_policy=30 --variant_policy=smooth
-#   ./eval.sh --variant_eval=async_rtc --fps_policy=30 --variant_policy=smooth
+#   ./eval.sh --variant_eval=async_smooth --fps_policy=30 --variant_policy=smooth
 #   ./eval.sh --variant_eval=async_discard --fps_policy=30 --variant_policy=smooth
+#
+# Policy paths are derived from fps and variant:
+#   - smooth + 10fps -> outputs/lerobot_policy_act_smooth_10fps_smooth_p1f2/...
+#   - smooth + 30fps -> outputs/lerobot_policy_act_smooth_30fps_smooth_p4f2/...
 #
 # NOTE: The configuration below is specific to Giacomo's setup.
 # You will need to substitute your own values:
@@ -18,9 +22,9 @@ VARIANT_EVAL=""
 VARIANT_POLICY=""
 FPS_POLICY=""
 CHECKPOINT="030003"
-MAX_DELAY="2"
-FPS_OBSERVATION=30
-EPISODE_TIME_S=60
+FPS_INTERPOLATION=30
+FPS_OBSERVATION=60
+EPISODE_TIME_S=30
 DISPLAY_DATA=true
 
 for arg in "$@"; do
@@ -37,14 +41,11 @@ for arg in "$@"; do
     --checkpoint=*)
       CHECKPOINT="${arg#*=}"
       ;;
-    --max_delay=*)
-      MAX_DELAY="${arg#*=}"
-      ;;
   esac
 done
 
 if [[ -z "$VARIANT_EVAL" || -z "$FPS_POLICY" || -z "$VARIANT_POLICY" ]]; then
-  echo "Usage: $0 --variant_eval=<sync|sync_discard|async_rtc|async_discard> --fps_policy=<fps> --variant_policy=<smooth|vanilla> [--checkpoint=030003] [--max_delay=2]"
+  echo "Usage: $0 --variant_eval=<sync|sync_discard|async_smooth|async_discard> --fps_policy=<fps> --variant_policy=<smooth|vanilla> [--checkpoint=030003]"
   exit 1
 fi
 
@@ -58,15 +59,29 @@ CAMERAS="{
   top:   { type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30 }
 }"
 
-# Build variant suffix: vanilla stays as-is, smooth becomes smooth_d{delay}
+# Build variant suffix based on policy variant and fps
+# Trained models use: smooth_p{past}f{future} naming (see train-act-smooth.sh)
 if [[ "$VARIANT_POLICY" == "smooth" ]]; then
-  VARIANT_SUFFIX="smooth_d${MAX_DELAY}"
+  case "$FPS_POLICY" in
+    10)
+      VARIANT_SUFFIX="smooth_p1f2"
+      THRESHOLD_REMAINING_ACTIONS=2
+      ;;
+    30)
+      VARIANT_SUFFIX="smooth_p4f2"
+      THRESHOLD_REMAINING_ACTIONS=2
+      ;;
+    *)
+      echo "Error: No trained smooth model for fps=$FPS_POLICY. Available: 10, 30"
+      exit 1
+      ;;
+  esac
 else
   VARIANT_SUFFIX="vanilla"
+  THRESHOLD_REMAINING_ACTIONS=1
 fi
 
 PATH_POLICY=outputs/lerobot_policy_act_smooth_${FPS_POLICY}fps_${VARIANT_SUFFIX}/checkpoints/${CHECKPOINT}/pretrained_model
-THRESHOLD_REMAINING_ACTIONS=$((MAX_DELAY))
 
 case "$VARIANT_EVAL" in
   sync)
@@ -109,22 +124,22 @@ case "$VARIANT_EVAL" in
         --display_data="$DISPLAY_DATA"
     ;;
 
-  async_rtc)
-    python scripts/eval/eval_async_rtc.py \
+  async_smooth)
+    python scripts/eval/eval_async_smooth.py \
         --robot.type=so101_follower \
         --robot.port=/dev/tty.usbmodem5A460829821 \
         --robot.id=arm_follower_0 \
         --robot.cameras="$CAMERAS" \
         --policy.path="$PATH_POLICY" \
         --fps_policy="$FPS_POLICY" \
+        --fps_interpolation="$FPS_INTERPOLATION" \
         --fps_observation="$FPS_OBSERVATION" \
-        --threshold_remaining_actions="$THRESHOLD_REMAINING_ACTIONS" \
         --episode_time_s="$EPISODE_TIME_S" \
         --display_data="$DISPLAY_DATA"
     ;;
 
   *)
-    echo "Error: --variant_eval must be one of: sync, sync_discard, async_rtc, async_discard"
+    echo "Error: --variant_eval must be one of: sync, sync_discard, async_smooth, async_discard"
     exit 1
     ;;
 esac

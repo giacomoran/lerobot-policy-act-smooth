@@ -30,9 +30,11 @@ import math
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from pprint import pformat
 
 import numpy as np
+import rerun as rr
 import torch
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.configs import parser
@@ -74,8 +76,9 @@ class EvalSyncDiscardConfig:
     # Override n_action_steps from policy config (None = use policy default)
     n_action_steps: int | None = None
 
-    # Display and feedback
+    # Display and recording
     display_data: bool = False
+    path_recording: str = ""
     play_sounds: bool = True
 
     def __post_init__(self):
@@ -87,6 +90,9 @@ class EvalSyncDiscardConfig:
 
         if self.policy is None:
             raise ValueError("A policy must be provided via --policy.path=...")
+
+        if self.path_recording:
+            Path(self.path_recording).parent.mkdir(parents=True, exist_ok=True)
 
         if self.fps_observation % self.fps_policy != 0:
             raise ValueError(
@@ -137,7 +143,7 @@ def run_inference_chunk(
     return actions, duration_ms_inference
 
 
-def compute_n_skip(duration_ms_inference: float, fps_policy: int) -> int:
+def compute_cnt_skip(duration_ms_inference: float, fps_policy: int) -> int:
     """Compute how many actions to skip based on inference latency.
 
     The policy assumes action[0] should execute at time t (when observation was taken).
@@ -145,8 +151,8 @@ def compute_n_skip(duration_ms_inference: float, fps_policy: int) -> int:
     We skip actions corresponding to this elapsed time.
     """
     duration_ms_frame = 1000.0 / fps_policy
-    n_skip = int(math.ceil(duration_ms_inference / duration_ms_frame))
-    return n_skip
+    cnt_skip = int(math.ceil(duration_ms_inference / duration_ms_frame))
+    return cnt_skip
 
 
 # ============================================================================
@@ -170,8 +176,8 @@ def run_episode_sync_discard(
     Control flow:
     1. Get observation
     2. Run inference to get full action chunk (n_action_steps actions)
-    3. Compute n_skip based on inference + execution latency
-    4. Execute actions[n_skip:] at target fps
+    3. Compute cnt_skip based on inference + execution latency
+    4. Execute actions[cnt_skip:] at target fps
     5. Repeat until episode ends
     """
     logging.info(
@@ -199,7 +205,7 @@ def run_episode_sync_discard(
     n_action_steps = cfg.n_action_steps if cfg.n_action_steps is not None else policy_n_action_steps
     logging.info(f"Using n_action_steps: {n_action_steps}")
 
-    num_frames_per_control_frame = cfg.fps_observation // cfg.fps_policy
+    cnt_frames_per_control_frame = cfg.fps_observation // cfg.fps_policy
     duration_s_frame_target = 1.0 / cfg.fps_observation
 
     # === WARMUP INFERENCE ===
@@ -207,8 +213,8 @@ def run_episode_sync_discard(
     logging.info("Running warmup inference...")
     dict_obs_warmup = robot.get_observation()
     observation_frame_warmup = {}
-    state_values_warmup = [dict_obs_warmup[motor_name] for motor_name in motor_names]
-    observation_frame_warmup["observation.state"] = np.array(state_values_warmup, dtype=np.float32)
+    array_proprio_obs_warmup = [dict_obs_warmup[motor_name] for motor_name in motor_names]
+    observation_frame_warmup["observation.state"] = np.array(array_proprio_obs_warmup, dtype=np.float32)
     for cam_name in camera_names:
         observation_frame_warmup[f"observation.images.{cam_name}"] = dict_obs_warmup[cam_name]
     _, duration_ms_warmup = run_inference_chunk(
@@ -223,8 +229,8 @@ def run_episode_sync_discard(
 
     ts_start_episode = time.perf_counter()
     idx_chunk = 0
-    count_total_actions = 0
-    count_frames_obs = 0
+    cnt_actions_total = 0
+    cnt_frames_observation = 0
 
     try:
         while True:
@@ -241,8 +247,8 @@ def run_episode_sync_discard(
             dict_obs = robot.get_observation()
 
             observation_frame = {}
-            state_values = [dict_obs[motor_name] for motor_name in motor_names]
-            observation_frame["observation.state"] = np.array(state_values, dtype=np.float32)
+            array_proprio_obs = [dict_obs[motor_name] for motor_name in motor_names]
+            observation_frame["observation.state"] = np.array(array_proprio_obs, dtype=np.float32)
             for cam_name in camera_names:
                 observation_frame[f"observation.images.{cam_name}"] = dict_obs[cam_name]
 
@@ -258,26 +264,26 @@ def run_episode_sync_discard(
             tracker_latency.record(duration_ms_inference, log_to_rerun=cfg.display_data)
 
             # === DISCARD COMPUTATION ===
-            n_skip = compute_n_skip(
+            cnt_skip = compute_cnt_skip(
                 duration_ms_inference=duration_ms_inference,
                 fps_policy=cfg.fps_policy,
             )
 
-            # Clamp n_skip to leave at least 1 action to execute
-            n_skip = min(n_skip, n_action_steps - 1)
+            # Clamp cnt_skip to leave at least 1 action to execute
+            cnt_skip = min(cnt_skip, n_action_steps - 1)
 
-            tracker_discard.record(n_skip, log_to_rerun=cfg.display_data)
+            tracker_discard.record(cnt_skip, log_to_rerun=cfg.display_data)
 
-            # Get actions to execute (skip first n_skip)
-            tensor_actions_to_execute = action_chunk[:, n_skip:, :]
-            n_actions = tensor_actions_to_execute.shape[1]
+            # Get actions to execute (skip first cnt_skip)
+            tensor_actions_to_execute = action_chunk[:, cnt_skip:, :]
+            cnt_actions = tensor_actions_to_execute.shape[1]
 
             logging.info(
-                f"Chunk {idx_chunk}: inference={duration_ms_inference:.1f}ms, skip={n_skip}, execute={n_actions}"
+                f"Chunk {idx_chunk}: inference={duration_ms_inference:.1f}ms, skip={cnt_skip}, execute={cnt_actions}"
             )
 
             # === EXECUTION PHASE ===
-            for idx_action in range(n_actions):
+            for idx_action in range(cnt_actions):
                 if events.get("exit_early") or events.get("stop_recording"):
                     break
 
@@ -289,13 +295,13 @@ def run_episode_sync_discard(
                 tensor_action = tensor_action.squeeze(0).cpu()  # (action_dim,)
                 robot_action = {name: float(tensor_action[i]) for i, name in enumerate(action_names)}
 
-                for idx_frame in range(num_frames_per_control_frame):
+                for idx_frame in range(cnt_frames_per_control_frame):
                     ts_start_frame = time.perf_counter()
 
                     is_control_frame = idx_frame == 0
                     if is_control_frame:
                         robot.send_action(robot_action)
-                        count_total_actions += 1
+                        cnt_actions_total += 1
 
                     if cfg.display_data:
                         if is_control_frame:
@@ -304,13 +310,14 @@ def run_episode_sync_discard(
                             dict_obs_motors = robot.bus.sync_read("Present_Position")
                             dict_obs_vis = {f"{motor}.pos": val for motor, val in dict_obs_motors.items()}
                         log_rerun_data(
-                            timestep=count_total_actions,
+                            idx_frame=cnt_frames_observation,
+                            timestep=cnt_actions_total,
                             idx_chunk=idx_chunk if is_control_frame else None,
                             observation=dict_obs_vis,
                             action=robot_action if is_control_frame else None,
                         )
 
-                    count_frames_obs += 1
+                    cnt_frames_observation += 1
 
                     duration_s_frame = time.perf_counter() - ts_start_frame
                     duration_s_sleep = duration_s_frame_target - duration_s_frame
@@ -323,17 +330,17 @@ def run_episode_sync_discard(
         logging.info("Interrupted by user")
 
     duration_s_total = time.perf_counter() - ts_start_episode
-    fps_obs_real = count_frames_obs / duration_s_total if duration_s_total > 0 else 0
-    fps_control_real = count_total_actions / duration_s_total if duration_s_total > 0 else 0
+    fps_observation_real = cnt_frames_observation / duration_s_total if duration_s_total > 0 else 0
+    fps_policy_real = cnt_actions_total / duration_s_total if duration_s_total > 0 else 0
     stats_discard = tracker_discard.get_stats()
-    count_total_discarded = stats_discard.get("count_total", 0) if stats_discard else 0
+    cnt_discarded_total = stats_discard.get("count_total", 0) if stats_discard else 0
     logging.info(
-        f"Episode complete: {count_total_actions} actions in {duration_s_total:.1f}s, "
-        f"{count_total_discarded} actions discarded"
+        f"Episode complete: {cnt_actions_total} actions in {duration_s_total:.1f}s, "
+        f"{cnt_discarded_total} actions discarded"
     )
     logging.info(
-        f"Real FPS: observation={fps_obs_real:.1f} (target={cfg.fps_observation}), "
-        f"control={fps_control_real:.1f} (target={cfg.fps_policy})"
+        f"Real FPS: observation={fps_observation_real:.1f} (target={cfg.fps_observation}), "
+        f"policy={fps_policy_real:.1f} (target={cfg.fps_policy})"
     )
 
     if cfg.display_data:
@@ -365,6 +372,9 @@ def main(cfg: EvalSyncDiscardConfig) -> None:
 
     if cfg.display_data:
         init_rerun(session_name="eval_sync_discard")
+        if cfg.path_recording:
+            rr.save(cfg.path_recording)
+            logging.info(f"Recording to {cfg.path_recording}")
 
     device = get_safe_torch_device(cfg.policy.device if cfg.policy.device else "auto")
     logging.info(f"Using device: {device}")

@@ -83,6 +83,18 @@ fi
 
 PATH_POLICY=outputs/lerobot_policy_act_smooth_${FPS_POLICY}fps_${VARIANT_SUFFIX}/checkpoints/${CHECKPOINT}/pretrained_model
 
+# Compute recording path with auto-incrementing run number
+DIR_RECORDING=outputs/recordings
+mkdir -p "$DIR_RECORDING"
+PREFIX_RECORDING="${VARIANT_EVAL}_${VARIANT_POLICY}_${FPS_POLICY}"
+# Find next run number (3-digit, zero-padded)
+IDX_RUN=0
+while [[ -f "${DIR_RECORDING}/${PREFIX_RECORDING}_$(printf '%03d' $IDX_RUN).rrd" ]]; do
+  IDX_RUN=$((IDX_RUN + 1))
+done
+PATH_RECORDING="${DIR_RECORDING}/${PREFIX_RECORDING}_$(printf '%03d' $IDX_RUN).rrd"
+echo "Recording to: $PATH_RECORDING"
+
 case "$VARIANT_EVAL" in
   sync)
     python scripts/eval/eval_sync.py \
@@ -94,7 +106,8 @@ case "$VARIANT_EVAL" in
         --fps_policy="$FPS_POLICY" \
         --fps_observation="$FPS_OBSERVATION" \
         --episode_time_s="$EPISODE_TIME_S" \
-        --display_data="$DISPLAY_DATA"
+        --display_data="$DISPLAY_DATA" \
+        --path_recording="$PATH_RECORDING"
     ;;
 
   sync_discard)
@@ -107,7 +120,8 @@ case "$VARIANT_EVAL" in
         --fps_policy="$FPS_POLICY" \
         --fps_observation="$FPS_OBSERVATION" \
         --episode_time_s="$EPISODE_TIME_S" \
-        --display_data="$DISPLAY_DATA"
+        --display_data="$DISPLAY_DATA" \
+        --path_recording="$PATH_RECORDING"
     ;;
 
   async_discard)
@@ -121,7 +135,8 @@ case "$VARIANT_EVAL" in
         --fps_observation="$FPS_OBSERVATION" \
         --threshold_remaining_actions="$THRESHOLD_REMAINING_ACTIONS" \
         --episode_time_s="$EPISODE_TIME_S" \
-        --display_data="$DISPLAY_DATA"
+        --display_data="$DISPLAY_DATA" \
+        --path_recording="$PATH_RECORDING"
     ;;
 
   async_smooth)
@@ -132,10 +147,11 @@ case "$VARIANT_EVAL" in
         --robot.cameras="$CAMERAS" \
         --policy.path="$PATH_POLICY" \
         --fps_policy="$FPS_POLICY" \
-        --fps_interpolation="$FPS_INTERPOLATION" \
-        --fps_observation="$FPS_OBSERVATION" \
+        --fps_interpolation=30 \
+        --fps_observation=60 \
         --episode_time_s="$EPISODE_TIME_S" \
-        --display_data="$DISPLAY_DATA"
+        --display_data="$DISPLAY_DATA" \
+        --path_recording="$PATH_RECORDING"
     ;;
 
   *)

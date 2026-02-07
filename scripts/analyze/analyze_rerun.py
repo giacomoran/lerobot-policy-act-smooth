@@ -1,15 +1,15 @@
 #!/usr/bin/env python
-"""Plot observations and actions from a .rrd rerun recording file.
+"""Analyze observations and actions from a .rrd rerun recording file.
 
-Creates a visualization where:
-- Observations are plotted as lines at display timesteps (higher frequency)
-- Actions are plotted as dots at control timesteps (lower frequency)
-- Vertical red lines mark chunk boundaries
+Produces:
+- Trajectory plot: obs (lines), commanded actions (small dots), policy actions (big dots)
+- Acceleration plot: obs vs action accelerations overlaid, faceted by motor
+- Kinematic scalar summaries (velocity uniformity, acceleration uniformity, mean velocity)
 
 Usage:
-    python scripts/eval-plots/plot_from_rerun.py \
+    python scripts/analyze/analyze_rerun.py \
         --path_rrd=outputs/recordings/run.rrd \
-        --path_output=outputs/plots/rerun_plot.png
+        --path_output=outputs/recordings/analyze_run
 """
 
 import logging
@@ -42,12 +42,13 @@ from utils_plotting import extract_scalar_from_rerun, save_plot, theme_publicati
 
 
 @dataclass
-class ConfigRerunPlot:
-    """Configuration for plotting from rerun recording."""
+class ConfigRerunAnalysis:
+    """Configuration for analyzing rerun recordings."""
 
     path_rrd: str = ""
 
-    # Output path (defaults to {rrd_name}_plot.png)
+    # Output stem prefix (no extension). Defaults to {rrd_dir}/analyze_{rrd_stem}.
+    # Produces files like {path_output}_trajectories.png, {path_output}_accelerations.png.
     path_output: str = ""
 
     # Motor names (comma-separated). Auto-detect if None.
@@ -62,7 +63,7 @@ class ConfigRerunPlot:
 
         if not self.path_output:
             path_rrd = Path(self.path_rrd)
-            self.path_output = str(path_rrd.parent / f"{path_rrd.stem}_plot.png")
+            self.path_output = str(Path("outputs/results-analyze") / f"analyze_{path_rrd.stem}")
 
 
 # ============================================================================
@@ -164,12 +165,24 @@ def build_dataframe_observations(
     df_result = pd.DataFrame(rows)
 
     if not df_result.empty:
-        # Drop consecutive duplicates to reduce data points for plotting.
-        df_result = df_result.sort_values(["name_motor", "idx_frame"])
-        shifted = df_result.groupby("name_motor")["value_position"].shift()
-        df_result = df_result[df_result["value_position"] != shifted].reset_index(drop=True)
+        df_result = df_result.sort_values(["name_motor", "idx_frame"]).reset_index(drop=True)
 
     return df_result
+
+
+def drop_consecutive_duplicates(
+    df: pd.DataFrame,
+    col_value: str = "value_position",
+    col_group: str = "name_motor",
+) -> pd.DataFrame:
+    """Drop rows where col_value equals the previous row within each col_group.
+
+    Useful for reducing data points before trajectory plotting, but should NOT
+    be applied before computing kinematics (velocity/acceleration) since it
+    creates frame gaps that produce wrong derivatives.
+    """
+    shifted = df.groupby(col_group)[col_value].shift()
+    return df[df[col_value] != shifted].reset_index(drop=True)
 
 
 def build_dataframe_actions(
@@ -263,6 +276,61 @@ def extract_indices_chunk_switch(df: pd.DataFrame, name_index: str) -> list[int]
 
 
 # ============================================================================
+# Kinematics
+# ============================================================================
+
+
+def compute_kinematics(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute velocity and acceleration from position data.
+
+    Works for both observations and actions — any tidy DataFrame with
+    idx_frame, name_motor, value_position.
+
+    Args:
+        df: Tidy DataFrame sorted by [name_motor, idx_frame].
+
+    Returns:
+        Augmented DataFrame with value_velocity and value_acceleration columns.
+        First 1-2 rows per motor will have NaN for derivatives.
+    """
+    df = df.copy().sort_values(["name_motor", "idx_frame"])
+    df["value_velocity"] = df.groupby("name_motor")["value_position"].diff()
+    df["value_acceleration"] = df.groupby("name_motor")["value_velocity"].diff()
+    return df
+
+
+def compute_scalars_kinematic(df_kinematics: pd.DataFrame) -> dict[str, float]:
+    """Compute Liu 2026 kinematic scalar measures.
+
+    Args:
+        df_kinematics: DataFrame with value_velocity and value_acceleration columns
+            (output of compute_kinematics).
+
+    Returns:
+        Dict with keys:
+        - uniformity_velocity (U_v): max across joints of per-joint velocity variance
+        - uniformity_acceleration (U_a): max across joints of per-joint acceleration variance
+        - mean_velocity (mu_v): mean absolute velocity across all joints and frames
+    """
+    df = df_kinematics.dropna(subset=["value_velocity"])
+
+    variance_velocity = df.groupby("name_motor")["value_velocity"].var()
+    uniformity_velocity = float(variance_velocity.max())
+
+    df_accel = df.dropna(subset=["value_acceleration"])
+    variance_acceleration = df_accel.groupby("name_motor")["value_acceleration"].var()
+    uniformity_acceleration = float(variance_acceleration.max())
+
+    mean_velocity = float(df["value_velocity"].abs().mean())
+
+    return {
+        "uniformity_velocity": uniformity_velocity,
+        "uniformity_acceleration": uniformity_acceleration,
+        "mean_velocity": mean_velocity,
+    }
+
+
+# ============================================================================
 # Plotting
 # ============================================================================
 
@@ -338,7 +406,7 @@ def create_plot(
             size=0.5,
         ),
         scale_color_manual(values=color_mapping),
-        labs(x="Frame index", y="Position (rad)", color="Motor"),
+        labs(x="Frame index", y="Position (deg)", color="Motor"),
         ggtitle("Obs (line), Commands (small dots), Policy actions (big dots)"),
         theme_publication(),
     ]
@@ -363,14 +431,79 @@ def create_plot(
     logging.info(f"Saved plot to {path_output}")
 
 
+def create_plot_accelerations(
+    df_accel_obs: pd.DataFrame,
+    df_accel_action: pd.DataFrame,
+    indices_chunk: list[int],
+    path_output: Path,
+) -> None:
+    """Create and save an acceleration plot with obs and action overlaid.
+
+    Faceted by motor, with chunk boundaries as vertical dashed lines.
+    Observation accelerations are solid lines, action accelerations are dashed.
+
+    Args:
+        df_accel_obs: Observation kinematics with value_acceleration (NaN-dropped).
+        df_accel_action: Action kinematics with value_acceleration (NaN-dropped).
+        indices_chunk: Frame indices where chunks switch.
+        path_output: Path to save the plot.
+    """
+    # Tag source for legend
+    df_obs = df_accel_obs[["idx_frame", "name_motor", "value_acceleration"]].copy()
+    df_obs["source"] = "observation"
+    df_act = df_accel_action[["idx_frame", "name_motor", "value_acceleration"]].copy()
+    df_act["source"] = "action"
+
+    df_chunk = pd.DataFrame({"idx_frame": indices_chunk})
+
+    n_motors = df_obs["name_motor"].nunique()
+    n_rows = (n_motors + 1) // 2
+    height = n_rows * 3 + 1
+    width = 14
+
+    plot = (
+        ggplot()
+        + geom_line(
+            data=df_obs,
+            mapping=aes(x="idx_frame", y="value_acceleration"),
+            color="#377EB8",
+            size=0.4,
+            alpha=0.7,
+        )
+        + geom_line(
+            data=df_act,
+            mapping=aes(x="idx_frame", y="value_acceleration"),
+            color="#E41A1C",
+            size=0.4,
+            alpha=0.5,
+            linetype="dashed",
+        )
+        + geom_vline(
+            data=df_chunk,
+            mapping=aes(xintercept="idx_frame"),
+            linetype="dashed",
+            color="gray",
+            alpha=0.5,
+            size=0.5,
+        )
+        + facet_wrap("~name_motor", ncol=2)
+        + labs(x="Frame index", y="Acceleration (deg/frame²)")
+        + ggtitle("Acceleration: observation (blue solid) vs action (red dashed)")
+        + theme_publication()
+    )
+
+    save_plot(plot, path_output, width=width, height=height)
+    logging.info(f"Saved plot to {path_output}")
+
+
 # ============================================================================
 # Main
 # ============================================================================
 
 
 @draccus.wrap()
-def main(cfg: ConfigRerunPlot):
-    """Main entry point for rerun plotting."""
+def main(cfg: ConfigRerunAnalysis):
+    """Main entry point for rerun analysis."""
     init_logging()
 
     path_rrd = Path(cfg.path_rrd)
@@ -388,6 +521,7 @@ def main(cfg: ConfigRerunPlot):
     if not names_motor:
         raise ValueError("No motor names found. Provide --names_motor or check the recording.")
 
+    # Build DataFrames (unfiltered)
     logging.info("Building observation DataFrame...")
     df_obs = build_dataframe_observations(df, names_motor, name_index)
     logging.info(f"  {len(df_obs)} observation rows")
@@ -399,9 +533,48 @@ def main(cfg: ConfigRerunPlot):
 
     indices_chunk = extract_indices_chunk_switch(df, name_index)
 
-    path_output = Path(cfg.path_output)
-    logging.info("Creating plot...")
-    create_plot(df_obs, df_action_commanded, df_action_policy, indices_chunk, cfg.faceted, path_output)
+    # Kinematics for observations
+    df_kinematics_obs = compute_kinematics(df_obs)
+    scalars_obs = compute_scalars_kinematic(df_kinematics_obs)
+
+    # Kinematics for commanded actions
+    df_kinematics_action = compute_kinematics(df_action_commanded)
+    scalars_action = compute_scalars_kinematic(df_kinematics_action)
+
+    # Log and write kinematic summaries
+    lines_results = [
+        f"source: {path_rrd}",
+        "",
+        "=== Kinematic Summary (Observations) ===",
+        f"  U_v  (velocity uniformity):     {scalars_obs['uniformity_velocity']:.6f}  deg²/frame²",
+        f"  U_a  (acceleration uniformity): {scalars_obs['uniformity_acceleration']:.6f}  deg²/frame⁴",
+        f"  mu_v (mean velocity):           {scalars_obs['mean_velocity']:.6f}  deg/frame",
+        "",
+        "=== Kinematic Summary (Actions) ===",
+        f"  U_v  (velocity uniformity):     {scalars_action['uniformity_velocity']:.6f}  deg²/frame²",
+        f"  U_a  (acceleration uniformity): {scalars_action['uniformity_acceleration']:.6f}  deg²/frame⁴",
+        f"  mu_v (mean velocity):           {scalars_action['mean_velocity']:.6f}  deg/frame",
+    ]
+    for line in lines_results:
+        logging.info(line)
+
+    path_results = Path(f"{cfg.path_output}_results.txt")
+    path_results.parent.mkdir(parents=True, exist_ok=True)
+    path_results.write_text("\n".join(lines_results) + "\n")
+    logging.info(f"Saved results to {path_results}")
+
+    # Plot 1: Trajectories (dedup for clean lines)
+    path_trajectories = Path(f"{cfg.path_output}_trajectories.png")
+    df_obs_deduped = drop_consecutive_duplicates(df_obs)
+    logging.info("Creating trajectory plot...")
+    create_plot(df_obs_deduped, df_action_commanded, df_action_policy, indices_chunk, cfg.faceted, path_trajectories)
+
+    # Plot 2: Accelerations (obs + action overlaid, faceted by motor)
+    path_accelerations = Path(f"{cfg.path_output}_accelerations.png")
+    df_accel_obs = df_kinematics_obs.dropna(subset=["value_acceleration"])
+    df_accel_action = df_kinematics_action.dropna(subset=["value_acceleration"])
+    logging.info("Creating acceleration plot...")
+    create_plot_accelerations(df_accel_obs, df_accel_action, indices_chunk, path_accelerations)
 
     logging.info("Done!")
 

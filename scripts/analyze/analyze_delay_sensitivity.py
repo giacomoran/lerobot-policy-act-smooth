@@ -7,7 +7,7 @@ Experiments:
 3. Translation past: fix d=D, full future prefix, vary offset on past prefix
 
 Usage:
-    python scripts/eval-plots/plot_delay_sensitivity.py \
+    python scripts/analyze/analyze_delay_sensitivity.py \
         --path_policy=outputs/model/pretrained_model \
         --id_repo_dataset=giacomoran/cube_hand_guided \
         --idx_episode=0 \

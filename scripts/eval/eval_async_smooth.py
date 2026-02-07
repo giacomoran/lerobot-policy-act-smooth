@@ -44,11 +44,13 @@ import time
 import traceback
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from pprint import pformat
 from threading import Event, Lock, Thread
 from typing import Optional
 
 import numpy as np
+import rerun as rr
 import torch
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.configs import parser
@@ -96,8 +98,9 @@ class EvalAsyncSmoothConfig:
     # Inference triggers when cnt_actions_remaining <= length_prefix_future.
     length_prefix_future: int | None = None
 
-    # Display and feedback
+    # Display and recording
     display_data: bool = False
+    path_recording: str = ""
     play_sounds: bool = True
 
     def __post_init__(self):
@@ -109,6 +112,9 @@ class EvalAsyncSmoothConfig:
 
         if self.policy is None:
             raise ValueError("A policy must be provided via --policy.path=...")
+
+        if self.path_recording:
+            Path(self.path_recording).parent.mkdir(parents=True, exist_ok=True)
 
         if self.fps_interpolation is None:
             self.fps_interpolation = self.fps_policy
@@ -420,7 +426,7 @@ def thread_actor_fn(
 
                     idx_chunk = action_chunk_active.idx_chunk if action_chunk_active else -1
 
-                if should_warn_interpolation_holding_action:
+                if should_warn_interpolation_holding_action and cfg.fps_interpolation > cfg.fps_policy:
                     if action is None:
                         logging.warning(
                             f"[ACTOR] Action gap at timestep={timestep}: active chunk exhausted, "
@@ -738,6 +744,9 @@ def main(cfg: EvalAsyncSmoothConfig) -> None:
 
     if cfg.display_data:
         init_rerun(session_name="eval_async_smooth")
+        if cfg.path_recording:
+            rr.save(cfg.path_recording)
+            logging.info(f"Recording to {cfg.path_recording}")
 
     name_device = cfg.policy.device if cfg.policy.device else "auto"
     device = get_safe_torch_device(name_device)

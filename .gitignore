@@ -76,3 +76,11 @@ datasets/
 # Others
 outputs/
 tmp/
+
+# Experiment artifacts (keep scripts/reports, exclude heavy files)
+experiments/**/checkpoints/
+experiments/**/*.bak
+experiments/**/*.safetensors
+experiments/**/*.bin
+experiments/**/*.pt
+experiments/**/*.png

@@ -70,6 +70,54 @@ python scripts/eval/eval_offline_replay.py \
 
 Machine 2 starts 03-relative-prediction immediately with LR=3e-5 (default). If LR sweep on Machine 1 finds a better LR, update and re-run.
 
+## Results
+
+### 01 -- LR Sweep
+
+| LR | Loss @ 5K steps |
+|----|----------------|
+| 1e-5 | 0.116 |
+| **3e-5** | **0.090** |
+| 5e-5 | 0.094 |
+| 1e-4 | 0.117 |
+| 3e-4 | 0.780 (diverged) |
+
+**Winner: lr=3e-5.** Used for all subsequent experiments.
+
+### Offline Eval (GT prefix replay, episodes 0/1/2)
+
+| Experiment | U_a (mean) | U_a (std) | Boundary Spike | Train Loss |
+|-----------|-----------|---------|-----------------|------------|
+| Baseline (prior, ckpt 050003) | 0.414 | 0.181 | 6.08x | — |
+| 02-obs-dropout p=0.1 | 0.351 | 0.134 | 4.76x | 0.039 |
+| **02-obs-dropout p=0.3** | **0.282** | **0.034** | **4.55x** | 0.039 |
+| 03-relative-prediction | 0.499 | 0.137 | 6.45x | 0.033 |
+
+Obs dropout p=0.3 is the best in offline eval: U_a 32% lower than baseline, boundary spike 25% lower, and notably consistent (std 0.034 vs 0.181 baseline). Relative prediction looks worse than baseline in offline eval.
+
+### Robot Eval (real SO101 arm, async_smooth at 30fps)
+
+| Experiment | Observation U_a |
+|-----------|----------------|
+| Baseline (prior, ckpt 050003) | ~0.25-0.40 (typical range) |
+| **03-relative-prediction** | **0.099** |
+
+Relative prediction produced visibly smooth motion on the real robot -- a dramatic improvement despite looking *worse* in offline eval.
+
+### Key Finding: Offline Eval Misses Self-Consistency
+
+The offline eval forces ground truth actions as the prefix at every chunk boundary. This measures how well the model matches GT, but NOT how smoothly its own predictions chain together.
+
+Relative prediction anchors each chunk's predictions to the previous chunk's output (via the delta transform). On the robot, where prefixes come from the model's own prior predictions, this self-consistency produces smooth boundaries. But in offline eval, the GT-to-prediction boundary shows high discontinuity because the model's deltas don't perfectly track GT trajectories.
+
+**Implication:** The offline replay eval with GT prefix is a poor proxy for real-robot smoothness when the training modification affects how chunks chain together. Future evaluation should include a "self-chaining" mode where predicted chunks feed into subsequent prefixes.
+
+## What Was Skipped
+
+- **02-obs-dropout p=0.5**: Skipped to save GPU time. p=0.3 showed the trend.
+- **02-obs-dropout robot eval**: Not tested on robot. Given the offline eval caveat above, robot testing would be informative.
+- **Combining relative prediction + obs dropout**: Not tested. Could be complementary.
+
 ## Base Training Command
 
 ```bash

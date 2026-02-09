@@ -13,11 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
-import os
-import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
@@ -88,6 +84,10 @@ class ACTSmoothConfig(PreTrainedConfig):
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
+        use_action_relative: Whether to transform actions into deltas relative to the observed state
+            at the observation timestep (a'_i = a_i - s_{t_0}). See the "Relative Action Representation"
+            section in the modeling module docstring for design rationale. Default False for backward
+            compatibility with existing checkpoints.
     """
 
     # Input / output structure.
@@ -126,8 +126,7 @@ class ACTSmoothConfig(PreTrainedConfig):
     #   Best of both: rich context for continuity + fast reactivity
     length_prefix_past: int = 0
     length_prefix_future: int = 1
-    # Deprecated: kept for backward compatibility with older configs/CLI.
-    max_delay: int | None = None
+    use_action_relative: bool = False
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -171,8 +170,6 @@ class ACTSmoothConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if self.max_delay is not None and self.length_prefix_future == 1:
-            self.length_prefix_future = self.max_delay
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}.")
         if self.n_action_steps > self.chunk_size:
@@ -189,71 +186,6 @@ class ACTSmoothConfig(PreTrainedConfig):
             )
         if self.length_prefix_past < 0:
             raise ValueError(f"length_prefix_past must be >= 0. Got {self.length_prefix_past}.")
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_name_or_path: str | Path,
-        *,
-        force_download: bool = False,
-        resume_download: bool | None = None,
-        proxies: dict | None = None,
-        token: str | bool | None = None,
-        cache_dir: str | Path | None = None,
-        local_files_only: bool = False,
-        revision: str | None = None,
-        **policy_kwargs,
-    ):
-        """Load config with backward compatibility for legacy ACTSmooth fields.
-
-        Supports loading older configs that still use `max_delay`.
-        """
-        # Import here to avoid adding hard dependencies at module import time.
-        import draccus
-        from huggingface_hub import hf_hub_download
-        from huggingface_hub.constants import CONFIG_NAME
-        from huggingface_hub.errors import HfHubHTTPError
-
-        model_id = str(pretrained_name_or_path)
-        config_file: str | None = None
-        if Path(model_id).is_dir():
-            if CONFIG_NAME in os.listdir(model_id):
-                config_file = os.path.join(model_id, CONFIG_NAME)
-        else:
-            try:
-                config_file = hf_hub_download(
-                    repo_id=model_id,
-                    filename=CONFIG_NAME,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    proxies=proxies,
-                    resume_download=resume_download,
-                    token=token,
-                    local_files_only=local_files_only,
-                )
-            except HfHubHTTPError as e:
-                raise FileNotFoundError(f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}") from e
-
-        if config_file is None:
-            raise FileNotFoundError(f"{CONFIG_NAME} not found in {Path(model_id).resolve()}")
-
-        with open(config_file) as f:
-            config = json.load(f)
-
-        # Remove legacy/registry fields and map deprecated keys.
-        config.pop("type", None)
-        max_delay = config.pop("max_delay", None)
-        if max_delay is not None and "length_prefix_future" not in config:
-            config["length_prefix_future"] = max_delay
-
-        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
-            json.dump(config, f)
-            config_file = f.name
-
-        cli_overrides = policy_kwargs.pop("cli_overrides", [])
-        with draccus.config_type("json"):
-            return draccus.parse(cls, config_file, args=cli_overrides)
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(

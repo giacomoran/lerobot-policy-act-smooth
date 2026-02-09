@@ -86,9 +86,10 @@ in consistent ACTION normalization units. See `_anchor_relative()`.
 Remaining limitation: σ_a is the std of absolute positions, not of deltas. Since deltas are
 typically much smaller than absolute positions, the model sees small normalized values. This
 hasn't caused issues in practice (the model learns to predict small offsets), but a cleaner
-solution would compute delta-specific normalization stats. This would require either stateful
-preprocessor steps (not supported by LeRobot's processor pipeline) or transforming actions in the
-dataset before stats computation.
+solution would compute delta-specific normalization stats. LeRobot does support stateful custom
+processor steps; however, estimating normalization stats online inside processors is brittle with
+multi-worker/distributed training. A more robust approach is to compute delta stats offline from
+the dataset and provide them via dataset_stats/processor overrides.
 """
 
 import math

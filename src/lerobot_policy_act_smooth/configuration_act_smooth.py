@@ -86,8 +86,7 @@ class ACTSmoothConfig(PreTrainedConfig):
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
         use_action_relative: Whether to transform actions into deltas relative to the observed state
             at the observation timestep (a'_i = a_i - s_{t_0}). See the "Relative Action Representation"
-            section in the modeling module docstring for design rationale. Default False for backward
-            compatibility with existing checkpoints.
+            section in the modeling module docstring for design rationale.
     """
 
     # Input / output structure.
@@ -126,7 +125,7 @@ class ACTSmoothConfig(PreTrainedConfig):
     #   Best of both: rich context for continuity + fast reactivity
     length_prefix_past: int = 0
     length_prefix_future: int = 1
-    use_action_relative: bool = False
+    use_action_relative: bool = True
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {

@@ -65,31 +65,17 @@ needs to predict motion offsets from a known anchor. This is a simpler function 
 the trajectory, not its absolute placement), and prediction errors near the boundary translate to
 smaller physical discontinuities since the offsets there are small.
 
-**Why anchor on observation.state (s_{t_0}) instead of the action at t_0?**
-Three reasons:
-1. Physical grounding: s_{t_0} is what the robot measured, not what was commanded. It represents
-   the true state from which future motion starts. This is consistent with approaches like UMI
-   (Chi et al., 2024) which use the observed state as the reference frame.
-2. Avoids prefix collapse: if anchoring on action at t_0, the first prefix element becomes exactly
-   zero (a_{t_0} - a_{t_0} = 0), wasting a prefix position. With s_{t_0} as anchor, all prefix
-   elements carry information since a_{t_i} - s_{t_0} ≠ 0 in general.
-3. Observation-aligned frame: the anchor matches the observation timestamp. The model sees an
-   image at t_0, proprioception s_{t_0}, and actions as offsets from s_{t_0} — all in one
-   consistent reference frame.
+**Anchor: action at t_0**
+The anchor is the action at position t_0 in the prefix — i.e. `batch[ACTION][:, length_prefix_past]`
+during training and `batch[INFERENCE_ACTION][:, length_prefix_past]` during inference. All actions
+(prefix + targets) become deltas relative to this anchor. This means the first future prefix
+element is always zero, but the model still sees non-trivial past prefix values and the relative
+offsets of future targets.
 
-**Normalization caveat:**
-Actions and observation.state are normalized with separate statistics (ACTION vs STATE mean/std).
-To avoid mixing normalization spaces, the anchor is converted from STATE space to ACTION space
-before subtraction: anchor = (s_norm * σ_s + μ_s - μ_a) / σ_a, yielding deltas (a - s) / σ_a
-in consistent ACTION normalization units. See `_anchor_relative()`.
-
-Remaining limitation: σ_a is the std of absolute positions, not of deltas. Since deltas are
-typically much smaller than absolute positions, the model sees small normalized values. This
-hasn't caused issues in practice (the model learns to predict small offsets), but a cleaner
-solution would compute delta-specific normalization stats. LeRobot does support stateful custom
-processor steps; however, estimating normalization stats online inside processors is brittle with
-multi-worker/distributed training. A more robust approach is to compute delta stats offline from
-the dataset and provide them via dataset_stats/processor overrides.
+We tried anchoring on observation.state (s_{t_0}) instead, but with teleop data the observation
+states are noisy (servo noise, communication jitter), making the relative representation
+inconsistent across chunks. The model trains fine (low L1 loss) but doesn't generalize to
+real inference where the noise pattern differs.
 """
 
 import math
@@ -140,7 +126,6 @@ class ACTSmoothPolicy(PreTrainedPolicy):
             config: Policy configuration class instance or None, in which case the default instantiation of
                     the configuration class is used.
             dataset_stats: Dataset statistics dict (feature_name -> {stat_name -> tensor}).
-                Used to register normalization stats for relative action representation.
         """
         super().__init__(config)
         config.validate_features()
@@ -158,28 +143,6 @@ class ACTSmoothPolicy(PreTrainedPolicy):
         self.register_buffer(
             "_indices_target", config.length_prefix_past + delays.unsqueeze(1) + offsets_chunk.unsqueeze(0)
         )
-
-        # Normalization stats for relative action representation.
-        # When use_action_relative=True, we need to convert the observation.state anchor
-        # from STATE normalization space to ACTION normalization space. See _anchor_relative().
-        # Buffers are always registered so load_state_dict can populate them from checkpoints.
-        # When stats aren't provided, NaN sentinels make accidental use fail loudly.
-        dim_action = config.action_feature.shape[0]
-        if dataset_stats is not None and config.use_action_relative:
-            stats_action = dataset_stats[ACTION]
-            stats_state = dataset_stats[OBS_STATE]
-            self.register_buffer("_stats_action_mean", torch.as_tensor(stats_action["mean"], dtype=torch.float32))
-            self.register_buffer("_stats_action_std", torch.as_tensor(stats_action["std"], dtype=torch.float32))
-            self.register_buffer("_stats_state_mean", torch.as_tensor(stats_state["mean"], dtype=torch.float32))
-            self.register_buffer("_stats_state_std", torch.as_tensor(stats_state["std"], dtype=torch.float32))
-        else:
-            # NaN sentinels: load_state_dict will overwrite these from the checkpoint.
-            # If not overwritten, _anchor_relative() raises a clear RuntimeError.
-            nan = torch.full((dim_action,), float("nan"))
-            self.register_buffer("_stats_action_mean", nan.clone())
-            self.register_buffer("_stats_action_std", nan.clone())
-            self.register_buffer("_stats_state_mean", nan.clone())
-            self.register_buffer("_stats_state_std", nan.clone())
 
         self.reset()
 
@@ -199,39 +162,6 @@ class ACTSmoothPolicy(PreTrainedPolicy):
     def reset(self):
         """This should be called whenever the environment is reset."""
         pass
-
-    def _anchor_relative(self, obs_state_normalized: Tensor) -> Tensor:
-        """Compute the relative action anchor in ACTION normalization space.
-
-        The preprocessor normalizes observation.state with STATE stats: s_norm = (s - μ_s) / σ_s.
-        For proper same-space subtraction, we convert the anchor to ACTION space:
-            anchor = (s_norm * σ_s + μ_s - μ_a) / σ_a = (s - μ_a) / σ_a
-
-        Then: a_norm - anchor = (a - μ_a)/σ_a - (s - μ_a)/σ_a = (a - s)/σ_a
-
-        This ensures the delta is in consistent ACTION normalization units.
-
-        Args:
-            obs_state_normalized: [B, state_dim] normalized observation state.
-
-        Returns:
-            [B, 1, action_dim] anchor suitable for broadcasting over action sequences.
-
-        Raises:
-            RuntimeError: If normalization stats were not initialized (NaN sentinel buffers).
-                This happens when use_action_relative=True but neither dataset_stats was passed
-                to __init__ nor a checkpoint was loaded via load_state_dict.
-        """
-        if torch.isnan(self._stats_action_mean).any():
-            raise RuntimeError(
-                "Relative action normalization stats are not initialized. "
-                "Either pass dataset_stats to the policy constructor or load a checkpoint "
-                "that was trained with use_action_relative=True."
-            )
-        anchor = (obs_state_normalized * self._stats_state_std + self._stats_state_mean - self._stats_action_mean) / (
-            self._stats_action_std + 1e-8
-        )
-        return anchor[:, None, :]
 
     def build_inference_action_prefix(
         self,
@@ -336,11 +266,11 @@ class ACTSmoothPolicy(PreTrainedPolicy):
         if self.config.image_features:
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        # Relative action representation: convert anchor from STATE to ACTION normalization
-        # space, subtract from prefix, predict deltas, then recover absolute actions.
-        # See module docstring and _anchor_relative() for details.
+        # Relative action representation: anchor on action at t_0 (index length_prefix_past
+        # in the prefix). Subtract anchor from prefix, predict relative chunk, add anchor back.
         if self.config.use_action_relative:
-            anchor = self._anchor_relative(batch[OBS_STATE])  # [B, 1, action_dim]
+            k = self.config.length_prefix_past
+            anchor = batch[INFERENCE_ACTION][:, k : k + 1]  # [B, 1, action_dim]
             batch[INFERENCE_ACTION] = batch[INFERENCE_ACTION] - anchor
             actions = self.model(batch)[0]
             actions = actions + anchor
@@ -382,10 +312,10 @@ class ACTSmoothPolicy(PreTrainedPolicy):
             f"Check that action_delta_indices matches: {self.config.action_delta_indices}"
         )
 
-        # Relative action representation: convert anchor from STATE to ACTION normalization
-        # space, then transform all actions to deltas. See module docstring and _anchor_relative().
+        # Relative action representation: anchor on action at t_0 (index length_prefix_past),
+        # transform all actions (prefix + targets) to deltas relative to this anchor.
         if self.config.use_action_relative:
-            anchor = self._anchor_relative(batch[OBS_STATE])  # [B, 1, action_dim]
+            anchor = batch[ACTION][:, length_prefix_past : length_prefix_past + 1]  # [B, 1, action_dim]
             batch = dict(batch)
             batch[ACTION] = batch[ACTION] - anchor
 

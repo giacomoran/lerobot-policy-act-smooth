@@ -345,6 +345,69 @@ class ACTSmoothPolicy(PreTrainedPolicy):
         return loss, loss_dict
 
 
+def _build_block_attn_masks(
+    n_shared: int,
+    n_branches: int,
+    n_branch_tokens: int,
+    chunk_size: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Build VLASH-style block attention masks for parallel delay training.
+
+    Packs D branches into the sequence dimension instead of expanding batch.
+    Shared tokens (images, latent, state, prefix_past) attend to all shared tokens.
+    Each branch's tokens attend to shared tokens + own branch only.
+
+    Args:
+        n_shared: Number of shared encoder tokens (images + latent + env_state + robot_state + prefix_past)
+        n_branches: D = length_prefix_future (number of delay branches)
+        n_branch_tokens: Number of tokens per branch in the encoder (= length_prefix_future, the prefix_future positions)
+        chunk_size: Number of decoder queries per branch
+        device: Target device
+
+    Returns:
+        (mask_enc, mask_dec_self, mask_dec_cross) — bool masks where True = blocked.
+    """
+    S_total_enc = n_shared + n_branches * n_branch_tokens
+
+    # Encoder self-attention mask [S_total_enc, S_total_enc]
+    mask_enc = torch.ones(S_total_enc, S_total_enc, dtype=torch.bool, device=device)
+
+    # Shared-to-shared: allowed
+    mask_enc[:n_shared, :n_shared] = False
+
+    for i in range(n_branches):
+        start = n_shared + i * n_branch_tokens
+        end = start + n_branch_tokens
+        # Branch i attends to shared: allowed
+        mask_enc[start:end, :n_shared] = False
+        # Branch i attends to itself: allowed
+        mask_enc[start:end, start:end] = False
+        # Shared attends to branch i: blocked (already True by default)
+
+    # Decoder self-attention mask [D*C, D*C] — block-diagonal
+    S_dec = n_branches * chunk_size
+    mask_dec_self = torch.ones(S_dec, S_dec, dtype=torch.bool, device=device)
+    for i in range(n_branches):
+        start = i * chunk_size
+        end = start + chunk_size
+        mask_dec_self[start:end, start:end] = False
+
+    # Decoder cross-attention mask [D*C, S_total_enc]
+    mask_dec_cross = torch.ones(S_dec, S_total_enc, dtype=torch.bool, device=device)
+    for i in range(n_branches):
+        dec_start = i * chunk_size
+        dec_end = dec_start + chunk_size
+        enc_start = n_shared + i * n_branch_tokens
+        enc_end = enc_start + n_branch_tokens
+        # Decoder branch i attends to shared encoder tokens
+        mask_dec_cross[dec_start:dec_end, :n_shared] = False
+        # Decoder branch i attends to its own encoder branch tokens
+        mask_dec_cross[dec_start:dec_end, enc_start:enc_end] = False
+
+    return mask_enc, mask_dec_self, mask_dec_cross
+
+
 class ACTSmooth(nn.Module):
     """ACTSmooth: The underlying neural network for ACTSmoothPolicy.
 
@@ -475,8 +538,8 @@ class ACTSmooth(nn.Module):
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
                 cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
 
-                encoder_in_tokens.extend(list(cam_features))
-                encoder_in_pos_embed.extend(list(cam_pos_embed))
+                encoder_in_tokens.append(cam_features)  # [h*w, B, dim]
+                encoder_in_pos_embed.append(cam_pos_embed)  # [h*w, 1, dim]
 
         # ===== TRAINING-BATCH PATH =====
         if is_training_batch:
@@ -528,114 +591,139 @@ class ACTSmooth(nn.Module):
 
             # 2. Latent token (learnable pos embed)
             pos_1d_idx = 0
-            encoder_in_tokens.append(self.encoder_latent_input_proj(latent_sample))
-            encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].unsqueeze(0))
+            encoder_in_tokens.append(self.encoder_latent_input_proj(latent_sample).unsqueeze(0))
+            encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].reshape(1, 1, -1))
             pos_1d_idx += 1
 
             # 3. Env state (if present)
             if self.config.env_state_feature:
-                encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
-                encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].unsqueeze(0))
+                encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]).unsqueeze(0))
+                encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].reshape(1, 1, -1))
                 pos_1d_idx += 1
 
             # 4. Robot state (if present)
             if self.config.robot_state_feature:
-                encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
-                encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].unsqueeze(0))
+                encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]).unsqueeze(0))
+                encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].reshape(1, 1, -1))
                 pos_1d_idx += 1
 
-            # Stack tokens before expansion
-            encoder_in_tokens = torch.stack(encoder_in_tokens, dim=0)  # [n_tokens, B, dim]
-            encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, dim=0)  # [n_tokens, 1, dim]
-
-            # Expand batch to evaluate all delays in parallel (see module docstring)
-            # Expansion happens AFTER backbone (expensive CNN runs once per sample, not per delay)
-            # Delays are {1, 2, ..., length_prefix_future} (d >= 1 because t_0 is always committed)
-            n_tokens = encoder_in_tokens.shape[0]
-            batch_size_effective = batch_size * length_prefix_future
-
-            # Expand encoder tokens: [n_tokens, B, dim] -> [n_tokens, B*length_prefix_future, dim]
-            encoder_in_tokens = encoder_in_tokens.unsqueeze(2).expand(-1, -1, length_prefix_future, -1)
-            encoder_in_tokens = encoder_in_tokens.reshape(n_tokens, batch_size_effective, -1)
-
-            # Expand pos_embed: [n_tokens, 1, dim] -> [n_tokens, B*length_prefix_future, dim]
-            encoder_in_pos_embed = encoder_in_pos_embed.expand(-1, batch_size_effective, -1)
-
-            # Create delays for all delay values: [length_prefix_future] -> [B*length_prefix_future]
-            # delays are 1, 2, ..., length_prefix_future (NOT 0, 1, ..., length_prefix_future)
-            delays = torch.arange(1, length_prefix_future + 1, dtype=torch.long, device=device)
-            delays = delays.unsqueeze(0).expand(batch_size, -1).reshape(-1)
-
-            # Expand actions: [B, seq_len, action_dim] -> [B*length_prefix_future, seq_len, action_dim]
-            actions = (
-                actions.unsqueeze(1)
-                .expand(-1, length_prefix_future, -1, -1)
-                .reshape(batch_size_effective, -1, actions.shape[-1])
-            )
-
-            # 5. Action history (past completed actions) - learnable pos embed
+            # 5. Action history (past completed actions) — shared, at batch B (no expand)
             if length_prefix_past > 0:
-                action_prefix_past = actions[:, :length_prefix_past]
-                is_pad_prefix_past = batch[ACTION_IS_PAD][:, :length_prefix_past]
-                # Expand padding mask for training
-                is_pad_prefix_past = (
-                    is_pad_prefix_past.unsqueeze(1)
-                    .expand(-1, length_prefix_future, -1)
-                    .reshape(batch_size_effective, length_prefix_past)
-                )
+                action_prefix_past = actions[:, :length_prefix_past]  # [B, K, action_dim]
+                is_pad_prefix_past = batch[ACTION_IS_PAD][:, :length_prefix_past]  # [B, K]
 
                 embed_prefix_past = self.encoder_action_prefix_input_proj(action_prefix_past)
 
-                # Replace padded positions with learnable action_prefix_pad_embed
                 embed_prefix_past = torch.where(
                     is_pad_prefix_past.unsqueeze(-1),
                     self.action_prefix_pad_embed[None, None, :].expand_as(embed_prefix_past),
                     embed_prefix_past,
                 )
 
-                tokens_prefix_past = embed_prefix_past.permute(1, 0, 2)  # [length_prefix_past, B_eff, dim]
-                encoder_in_tokens = torch.cat([encoder_in_tokens, tokens_prefix_past], dim=0)
-
-                # Positional embeddings for history
-                pos_embed_prefix_past = self.encoder_1d_feature_pos_embed.weight[
-                    pos_1d_idx : pos_1d_idx + length_prefix_past
-                ]
-                pos_embed_prefix_past = pos_embed_prefix_past.unsqueeze(1).expand(-1, batch_size_effective, -1)
-                encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, pos_embed_prefix_past], dim=0)
+                encoder_in_tokens.append(embed_prefix_past.permute(1, 0, 2))  # [K, B, dim]
+                encoder_in_pos_embed.append(
+                    self.encoder_1d_feature_pos_embed.weight[pos_1d_idx : pos_1d_idx + length_prefix_past].unsqueeze(1)
+                )  # [K, 1, dim]
                 pos_1d_idx += length_prefix_past
 
-            # 6. Committed pending actions - learnable pos embed
-            action_prefix_future = actions[:, length_prefix_past : length_prefix_past + length_prefix_future]
+            # Record n_shared before adding branch tokens
+            n_shared = sum(t.shape[0] for t in encoder_in_tokens)
 
-            # Compute mask from delays and ACTION_IS_PAD
-            pad_prefix_future = batch[ACTION_IS_PAD][:, length_prefix_past : length_prefix_past + length_prefix_future]
-            pad_prefix_future = (
-                pad_prefix_future.unsqueeze(1)
-                .expand(-1, length_prefix_future, -1)
-                .reshape(batch_size_effective, length_prefix_future)
+            # 6. length_prefix_future branches of prefix_future — packed into sequence dim with block attention
+            # Each branch has length_prefix_future positions, total length_prefix_future^2 tokens appended.
+            # For branch d (delay=d), positions 0..d-1 are valid, positions d..length_prefix_future-1 are padded.
+            action_prefix_future = actions[
+                :, length_prefix_past : length_prefix_past + length_prefix_future
+            ]  # [B, length_prefix_future, action_dim]
+            pad_prefix_future = batch[ACTION_IS_PAD][
+                :, length_prefix_past : length_prefix_past + length_prefix_future
+            ]  # [B, length_prefix_future]
+
+            # Project all future prefix positions at once: [B, length_prefix_future, dim]
+            embed_prefix_future_all = self.encoder_action_prefix_input_proj(action_prefix_future)
+
+            # Build length_prefix_future branches, each with length_prefix_future positions
+            # For branch d (0-indexed: d=0 means delay=1), positions >= delay are padded
+            delays = torch.arange(1, length_prefix_future + 1, dtype=torch.long, device=device)
+            positions = torch.arange(length_prefix_future, dtype=torch.long, device=device)
+
+            # is_pad_branch[d, pos] = True if pos >= delay_d, for delay masking
+            is_pad_delay = positions[None, :] >= delays[:, None]  # [length_prefix_future, length_prefix_future]
+
+            # Combine with data padding
+            is_pad_branch = (
+                is_pad_delay[None, :, :] | pad_prefix_future[:, None, :]
+            )  # [B, length_prefix_future, length_prefix_future]
+
+            # Replicate embeddings for each branch: [B, length_prefix_future, dim] -> [B, length_prefix_future, length_prefix_future, dim]
+            embed_branches = embed_prefix_future_all.unsqueeze(1).expand(-1, length_prefix_future, -1, -1)
+
+            # Apply pad_embed to padded positions
+            embed_branches = torch.where(
+                is_pad_branch.unsqueeze(-1),
+                self.action_prefix_pad_embed[None, None, None, :].expand_as(embed_branches),
+                embed_branches,
             )
-            is_pad_prefix_future = (
-                torch.arange(length_prefix_future, device=device)[None, :] >= delays[:, None]
-            ) | pad_prefix_future
 
-            embed_prefix_future = self.encoder_action_prefix_input_proj(action_prefix_future)
-
-            # Replace invalid positions with learnable action_prefix_pad_embed
-            embed_prefix_future = torch.where(
-                is_pad_prefix_future.unsqueeze(-1),
-                self.action_prefix_pad_embed[None, None, :].expand_as(embed_prefix_future),
-                embed_prefix_future,
+            # Reshape to sequence: [B, length_prefix_future, length_prefix_future, dim] -> [length_prefix_future^2, B, dim]
+            encoder_in_tokens.append(
+                embed_branches.reshape(batch_size, length_prefix_future * length_prefix_future, -1).permute(1, 0, 2)
             )
 
-            tokens_prefix_future = embed_prefix_future.permute(1, 0, 2)  # [length_prefix_future, B_eff, dim]
-            encoder_in_tokens = torch.cat([encoder_in_tokens, tokens_prefix_future], dim=0)
-
-            # Positional embeddings for action prefix
+            # Positional embeddings: same positions repeated for each branch
             pos_embed_prefix_future = self.encoder_1d_feature_pos_embed.weight[
                 pos_1d_idx : pos_1d_idx + length_prefix_future
-            ]
-            pos_embed_prefix_future = pos_embed_prefix_future.unsqueeze(1).expand(-1, batch_size_effective, -1)
-            encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, pos_embed_prefix_future], dim=0)
+            ]  # [length_prefix_future, dim]
+            encoder_in_pos_embed.append(
+                pos_embed_prefix_future.repeat(length_prefix_future, 1).unsqueeze(1)
+            )  # [length_prefix_future^2, 1, dim]
+
+            # Assemble encoder input
+            encoder_in_tokens = torch.cat(encoder_in_tokens, dim=0)  # [S_total, B, dim]
+            encoder_in_pos_embed = torch.cat(encoder_in_pos_embed, dim=0)  # [S_total, 1, dim]
+            encoder_in_pos_embed = encoder_in_pos_embed.expand(-1, batch_size, -1)  # [S_total, B, dim]
+
+            # Build block attention masks (cached)
+            if not hasattr(self, "_cached_block_attn_masks") or self._cached_block_attn_masks[0] != n_shared:
+                self._cached_block_attn_masks = (
+                    n_shared,
+                    *_build_block_attn_masks(
+                        n_shared, length_prefix_future, length_prefix_future, self.config.chunk_size, device
+                    ),
+                )
+            _, mask_enc, mask_dec_self, mask_dec_cross = self._cached_block_attn_masks
+
+            # Encoder (batch B, block attention)
+            encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed, attn_mask=mask_enc)
+
+            # Decoder: length_prefix_future branches of chunk_size zero-queries packed in sequence dim
+            decoder_in = torch.zeros(
+                (length_prefix_future * self.config.chunk_size, batch_size, self.config.dim_model),
+                dtype=encoder_in_pos_embed.dtype,
+                device=device,
+            )
+            # Same chunk pos embed repeated for each branch
+            decoder_pos_embed = self.decoder_pos_embed.weight.repeat(length_prefix_future, 1).unsqueeze(1)
+
+            decoder_out = self.decoder(
+                decoder_in,
+                encoder_out,
+                encoder_pos_embed=encoder_in_pos_embed,
+                decoder_pos_embed=decoder_pos_embed,
+                self_attn_mask=mask_dec_self,
+                cross_attn_mask=mask_dec_cross,
+            )
+
+            # [length_prefix_future*C, B, dim] -> [B*length_prefix_future, C, dim] for loss computation
+            decoder_out = decoder_out.reshape(
+                length_prefix_future, self.config.chunk_size, batch_size, self.config.dim_model
+            )
+            decoder_out = decoder_out.permute(2, 0, 1, 3).reshape(
+                batch_size * length_prefix_future, self.config.chunk_size, -1
+            )
+            actions_out = self.action_head(decoder_out)
+
+            return actions_out, (mu, log_sigma_x2)
 
         # ===== INFERENCE-BATCH PATH =====
         else:
@@ -647,28 +735,21 @@ class ACTSmooth(nn.Module):
 
             # 2. Latent token (learnable pos embed)
             pos_1d_idx = 0
-            encoder_in_tokens.append(self.encoder_latent_input_proj(latent_sample))
-            encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].unsqueeze(0))
+            encoder_in_tokens.append(self.encoder_latent_input_proj(latent_sample).unsqueeze(0))
+            encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].reshape(1, 1, -1))
             pos_1d_idx += 1
 
             # 3. Env state (if present)
             if self.config.env_state_feature:
-                encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
-                encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].unsqueeze(0))
+                encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]).unsqueeze(0))
+                encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].reshape(1, 1, -1))
                 pos_1d_idx += 1
 
             # 4. Robot state (if present)
             if self.config.robot_state_feature:
-                encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
-                encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].unsqueeze(0))
+                encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]).unsqueeze(0))
+                encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[pos_1d_idx].reshape(1, 1, -1))
                 pos_1d_idx += 1
-
-            # Stack tokens
-            encoder_in_tokens = torch.stack(encoder_in_tokens, dim=0)  # [n_tokens, B, dim]
-            encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, dim=0)  # [n_tokens, 1, dim]
-
-            batch_size_effective = batch_size
-            encoder_in_pos_embed = encoder_in_pos_embed.expand(-1, batch_size_effective, -1)
 
             # 5. Action history (past completed actions) - learnable pos embed
             if length_prefix_past > 0:
@@ -684,15 +765,10 @@ class ACTSmooth(nn.Module):
                     embed_prefix_past,
                 )
 
-                tokens_prefix_past = embed_prefix_past.permute(1, 0, 2)  # [length_prefix_past, B_eff, dim]
-                encoder_in_tokens = torch.cat([encoder_in_tokens, tokens_prefix_past], dim=0)
-
-                # Positional embeddings for history
-                pos_embed_prefix_past = self.encoder_1d_feature_pos_embed.weight[
-                    pos_1d_idx : pos_1d_idx + length_prefix_past
-                ]
-                pos_embed_prefix_past = pos_embed_prefix_past.unsqueeze(1).expand(-1, batch_size_effective, -1)
-                encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, pos_embed_prefix_past], dim=0)
+                encoder_in_tokens.append(embed_prefix_past.permute(1, 0, 2))  # [K, B, dim]
+                encoder_in_pos_embed.append(
+                    self.encoder_1d_feature_pos_embed.weight[pos_1d_idx : pos_1d_idx + length_prefix_past].unsqueeze(1)
+                )  # [K, 1, dim]
                 pos_1d_idx += length_prefix_past
 
             # 6. Committed pending actions - learnable pos embed
@@ -709,22 +785,22 @@ class ACTSmooth(nn.Module):
                 embed_prefix_future,
             )
 
-            tokens_prefix_future = embed_prefix_future.permute(1, 0, 2)  # [length_prefix_future, B_eff, dim]
-            encoder_in_tokens = torch.cat([encoder_in_tokens, tokens_prefix_future], dim=0)
+            encoder_in_tokens.append(embed_prefix_future.permute(1, 0, 2))  # [D, B, dim]
+            encoder_in_pos_embed.append(
+                self.encoder_1d_feature_pos_embed.weight[pos_1d_idx : pos_1d_idx + length_prefix_future].unsqueeze(1)
+            )  # [D, 1, dim]
 
-            # Positional embeddings for action prefix
-            pos_embed_prefix_future = self.encoder_1d_feature_pos_embed.weight[
-                pos_1d_idx : pos_1d_idx + length_prefix_future
-            ]
-            pos_embed_prefix_future = pos_embed_prefix_future.unsqueeze(1).expand(-1, batch_size_effective, -1)
-            encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, pos_embed_prefix_future], dim=0)
+        # Assemble encoder input
+        encoder_in_tokens = torch.cat(encoder_in_tokens, dim=0)  # [S_total, B, dim]
+        encoder_in_pos_embed = torch.cat(encoder_in_pos_embed, dim=0)  # [S_total, 1, dim]
+        encoder_in_pos_embed = encoder_in_pos_embed.expand(-1, batch_size, -1)  # [S_total, B, dim]
 
-        # ===== SHARED: Encoder-Decoder forward =====
+        # ===== Inference: Encoder-Decoder forward (no masks, single delay) =====
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
         decoder_in = torch.zeros(
-            (self.config.chunk_size, batch_size_effective, self.config.dim_model),
+            (self.config.chunk_size, batch_size, self.config.dim_model),
             dtype=encoder_in_pos_embed.dtype,
-            device=encoder_in_pos_embed.device,
+            device=device,
         )
         decoder_out = self.decoder(
             decoder_in,
@@ -749,9 +825,15 @@ class ACTSmoothEncoder(nn.Module):
         self.layers = nn.ModuleList([ACTSmoothEncoderLayer(config) for _ in range(num_layers)])
         self.norm = nn.LayerNorm(config.dim_model) if config.pre_norm else nn.Identity()
 
-    def forward(self, x: Tensor, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        pos_embed: Tensor | None = None,
+        key_padding_mask: Tensor | None = None,
+        attn_mask: Tensor | None = None,
+    ) -> Tensor:
         for layer in self.layers:
-            x = layer(x, pos_embed=pos_embed, key_padding_mask=key_padding_mask)
+            x = layer(x, pos_embed=pos_embed, key_padding_mask=key_padding_mask, attn_mask=attn_mask)
         x = self.norm(x)
         return x
 
@@ -773,12 +855,18 @@ class ACTSmoothEncoderLayer(nn.Module):
         self.activation = get_activation_fn(config.feedforward_activation)
         self.pre_norm = config.pre_norm
 
-    def forward(self, x, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x,
+        pos_embed: Tensor | None = None,
+        key_padding_mask: Tensor | None = None,
+        attn_mask: Tensor | None = None,
+    ) -> Tensor:
         skip = x
         if self.pre_norm:
             x = self.norm1(x)
         q = k = x if pos_embed is None else x + pos_embed
-        x = self.self_attn(q, k, value=x, key_padding_mask=key_padding_mask)
+        x = self.self_attn(q, k, value=x, key_padding_mask=key_padding_mask, attn_mask=attn_mask)
         x = x[0]
         x = skip + self.dropout1(x)
         if self.pre_norm:
@@ -807,9 +895,18 @@ class ACTSmoothDecoder(nn.Module):
         encoder_out: Tensor,
         decoder_pos_embed: Tensor | None = None,
         encoder_pos_embed: Tensor | None = None,
+        self_attn_mask: Tensor | None = None,
+        cross_attn_mask: Tensor | None = None,
     ) -> Tensor:
         for layer in self.layers:
-            x = layer(x, encoder_out, decoder_pos_embed=decoder_pos_embed, encoder_pos_embed=encoder_pos_embed)
+            x = layer(
+                x,
+                encoder_out,
+                decoder_pos_embed=decoder_pos_embed,
+                encoder_pos_embed=encoder_pos_embed,
+                self_attn_mask=self_attn_mask,
+                cross_attn_mask=cross_attn_mask,
+            )
         if self.norm is not None:
             x = self.norm(x)
         return x
@@ -844,12 +941,14 @@ class ACTSmoothDecoderLayer(nn.Module):
         encoder_out: Tensor,
         decoder_pos_embed: Tensor | None = None,
         encoder_pos_embed: Tensor | None = None,
+        self_attn_mask: Tensor | None = None,
+        cross_attn_mask: Tensor | None = None,
     ) -> Tensor:
         skip = x
         if self.pre_norm:
             x = self.norm1(x)
         q = k = self.maybe_add_pos_embed(x, decoder_pos_embed)
-        x = self.self_attn(q, k, value=x)[0]
+        x = self.self_attn(q, k, value=x, attn_mask=self_attn_mask)[0]
         x = skip + self.dropout1(x)
         if self.pre_norm:
             skip = x
@@ -861,6 +960,7 @@ class ACTSmoothDecoderLayer(nn.Module):
             query=self.maybe_add_pos_embed(x, decoder_pos_embed),
             key=self.maybe_add_pos_embed(encoder_out, encoder_pos_embed),
             value=encoder_out,
+            attn_mask=cross_attn_mask,
         )[0]
         x = skip + self.dropout2(x)
         if self.pre_norm:

@@ -82,6 +82,9 @@ class EvalAsyncDiscardConfig:
     # Remaining actions threshold: trigger inference when remaining actions drops below this
     threshold_remaining_actions: int = 2
 
+    # Injected delay (ms) to simulate extra inference latency
+    delay_ms_injected: int = 0
+
     # Display and recording
     display_data: bool = False
     path_recording: str = ""
@@ -265,8 +268,8 @@ def step_actor_control_frame(args: ArgsStepActorControlFrame) -> OutputStepActor
 
     # --- From here, action and action_chunk_active are guaranteed non-None ---
 
-    # 4. Inference trigger: strict < (not <=)
-    should_request_inference = can_request_inference and cnt_actions_remaining < args.threshold_remaining_actions
+    # 4. Inference trigger
+    should_request_inference = can_request_inference and cnt_actions_remaining <= args.threshold_remaining_actions
 
     # 5. Interpolation target: next timestep's action
     timestep_next = args.timestep + 1
@@ -501,6 +504,9 @@ def thread_inference_fn(
                 # Use predict_action_chunk without prefix (works for both ACT and ACTSmooth)
                 actions = policy.predict_action_chunk(observation)
                 actions = actions[:, :n_action_steps, :]
+
+            if cfg.delay_ms_injected > 0:
+                time.sleep(cfg.delay_ms_injected / 1000.0)
 
             duration_ms_inference = (time.perf_counter() - ts_start_inference) * 1000
 

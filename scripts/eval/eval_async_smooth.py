@@ -94,9 +94,13 @@ class EvalAsyncSmoothConfig:
     # Override n_action_steps from policy config (None = use policy default)
     n_action_steps: int | None = None
 
-    # Action prefix length for inference (None = use policy config value).
-    # Inference triggers when cnt_actions_remaining <= length_prefix_future.
-    length_prefix_future: int | None = None
+    # Trigger inference when remaining actions <= threshold_remaining_actions.
+    # When < length_prefix_future, fewer future actions are available at trigger time;
+    # the model pads shorter prefixes, which are then masked out.
+    threshold_remaining_actions: int | None = None  # None = length_prefix_future from policy
+
+    # Injected delay (ms) to simulate extra inference latency
+    delay_ms_injected: int = 0
 
     # Display and recording
     display_data: bool = False
@@ -161,7 +165,9 @@ class ActionChunk:
         timestep_start = timestep_start_obs + D
 
     Where D = length_prefix_future_effective:
-        - length_prefix_future (from config) for non-first chunks
+        - min(length_prefix_future, actions available at trigger) for non-first chunks.
+          When threshold_remaining_actions < length_prefix_future, fewer actions remain
+          at trigger time. The model pads shorter prefixes.
         - 1 for the first chunk (no prior actions available)
 
     The future prefix starts at the observation timestep (t_0), so the first
@@ -172,16 +178,12 @@ class ActionChunk:
         actions: Action tensor [n_actions, action_dim] as ABSOLUTE joint positions
         timestep_start_obs: Timestep when observation was captured for this chunk's inference
         length_prefix_future_effective: Number of future prefix actions used for this chunk's inference
-        length_prefix_future: Config value for future prefix length
-        length_prefix_past: Config value for past prefix length
         idx_chunk: Inference counter that generated this chunk (for logging)
     """
 
     actions: torch.Tensor
     timestep_start_obs: int  # When observation was captured
-    length_prefix_future_effective: int  # Prefix length: config value or 1 for first chunk
-    length_prefix_future: int  # Config constant
-    length_prefix_past: int  # Config constant
+    length_prefix_future_effective: int  # Actual future prefix size (≤ length_prefix_future)
     idx_chunk: int
 
     @property
@@ -200,9 +202,9 @@ class ActionChunk:
         """Get number of actions from timestep onwards (including it).
 
         Inclusive so the inference trigger reads naturally:
-            cnt_actions_remaining_from(t) <= length_prefix_future
-        means "the remaining actions (including the current one) fit inside the
-        future prefix", i.e. it's time to request a new chunk.
+            cnt_actions_remaining_from(t) <= threshold_remaining_actions
+        means "the remaining actions (including the current one) are at or below
+        the threshold", i.e. it's time to request a new chunk.
         """
         idx = timestep - self.timestep_start
         return max(0, len(self.actions) - idx)
@@ -261,7 +263,7 @@ class ArgsStepActorControlFrame:
     action_chunk_active: ActionChunk | None
     action_chunk_pending: ActionChunk | None
     is_inference_requested: bool
-    length_prefix_future: int
+    threshold_remaining_actions: int
 
 
 @dataclass
@@ -317,9 +319,9 @@ def step_actor_control_frame(args: ArgsStepActorControlFrame) -> OutputStepActor
 
     cnt_actions_remaining = action_chunk_active.cnt_actions_remaining_from(args.timestep)
 
-    # 3. Inference trigger: remaining actions (inclusive of current) all belong to the
-    #    future prefix, so there are no unprefixed actions left — time for a new chunk.
-    should_request_inference = can_request_inference and cnt_actions_remaining <= args.length_prefix_future
+    # 3. Inference trigger: remaining actions (inclusive of current) are at or below
+    #    the threshold — time for a new chunk.
+    should_request_inference = can_request_inference and cnt_actions_remaining <= args.threshold_remaining_actions
 
     # 4. Interpolation target: next timestep's action
     timestep_next = args.timestep + 1
@@ -394,7 +396,7 @@ def thread_actor_fn(
                             action_chunk_active=action_chunk_active,
                             action_chunk_pending=state.action_chunk_pending,
                             is_inference_requested=state.timestep_inference_requested is not None,
-                            length_prefix_future=cfg.length_prefix_future,
+                            threshold_remaining_actions=cfg.threshold_remaining_actions,
                         )
                     )
 
@@ -524,6 +526,8 @@ class ArgsMakePrefixForInference:
 
     timestep: int
     action_chunk_active: ActionChunk
+    length_prefix_future: int
+    length_prefix_past: int
 
 
 @dataclass
@@ -544,17 +548,22 @@ def make_prefix_for_inference(args: ArgsMakePrefixForInference) -> OutputMakePre
 
         past:   [timestep - k, timestep)            → t_{-k}, ..., t_{-1}
         future: [timestep, timestep + D)             → t_0, t_1, ..., t_{D-1}
+
+    Requests up to length_prefix_future actions, but actions_between clips to
+    what's available. When threshold_remaining_actions < length_prefix_future,
+    fewer actions remain at trigger time, so length_prefix_future_effective
+    = action_prefix_future.shape[1] ≤ length_prefix_future.
     """
     action_prefix_future = args.action_chunk_active.actions_between(
-        args.timestep, args.timestep + args.action_chunk_active.length_prefix_future
+        args.timestep, args.timestep + args.length_prefix_future
     )
     action_prefix_past = args.action_chunk_active.actions_between(
-        args.timestep - args.action_chunk_active.length_prefix_past, args.timestep
+        args.timestep - args.length_prefix_past, args.timestep
     )
     return OutputMakePrefixForInference(
         action_prefix_future=action_prefix_future,
         action_prefix_past=action_prefix_past,
-        length_prefix_future_effective=args.action_chunk_active.length_prefix_future,
+        length_prefix_future_effective=action_prefix_future.shape[1],
     )
 
 
@@ -606,6 +615,7 @@ def thread_inference_fn(
     camera_names: list[str],
     tracker_latency: LatencyTracker,
     robot_type: str,
+    length_prefix_future: int,
     length_prefix_past: int,
 ) -> None:
     """Inference thread: waits for signal, runs inference with action prefix, creates new action chunk."""
@@ -633,6 +643,8 @@ def thread_inference_fn(
                     ArgsMakePrefixForInference(
                         timestep=timestep,
                         action_chunk_active=action_chunk_active,
+                        length_prefix_future=length_prefix_future,
+                        length_prefix_past=length_prefix_past,
                     )
                 )
             else:
@@ -694,6 +706,9 @@ def thread_inference_fn(
                 actions = policy.predict_action_chunk(observation)
                 actions = actions[:, :n_action_steps, :]
 
+            if cfg.delay_ms_injected > 0:
+                time.sleep(cfg.delay_ms_injected / 1000.0)
+
             duration_ms_inference = (time.perf_counter() - ts_start_inference) * 1000
 
             if state.event_shutdown.is_set():
@@ -708,8 +723,6 @@ def thread_inference_fn(
                 actions=actions.squeeze(0),
                 timestep_start_obs=timestep,
                 length_prefix_future_effective=length_prefix_future_effective,
-                length_prefix_future=cfg.length_prefix_future,
-                length_prefix_past=length_prefix_past,
                 idx_chunk=idx_chunk,
             )
 
@@ -760,35 +773,31 @@ def main(cfg: EvalAsyncSmoothConfig) -> None:
     policy = policy_class.from_pretrained(cfg.policy.pretrained_path)
     policy.to(device)
 
-    length_prefix_future_policy = getattr(policy.config, "length_prefix_future", 0)
+    length_prefix_future = getattr(policy.config, "length_prefix_future", 0)
     length_prefix_past = getattr(policy.config, "length_prefix_past", 0)
-    if length_prefix_future_policy < 1:
+    if length_prefix_future < 1:
         raise ValueError(
-            f"eval_async_smooth requires ACTSmooth policy with length_prefix_future >= 1, got {length_prefix_future_policy}"
+            f"eval_async_smooth requires ACTSmooth policy with length_prefix_future >= 1, got {length_prefix_future}"
         )
 
-    # Use policy's length_prefix_future if not specified via CLI
-    if cfg.length_prefix_future is None:
-        cfg.length_prefix_future = length_prefix_future_policy
-    elif cfg.length_prefix_future > length_prefix_future_policy:
-        raise ValueError(
-            f"Requested length_prefix_future ({cfg.length_prefix_future}) exceeds policy's "
-            f"length_prefix_future ({length_prefix_future_policy})"
-        )
+    # Resolve threshold_remaining_actions: default to length_prefix_future
+    if cfg.threshold_remaining_actions is None:
+        cfg.threshold_remaining_actions = length_prefix_future
+
     logging.info(
-        f"Policy length_prefix_future: {length_prefix_future_policy}, length_prefix_past: {length_prefix_past}. "
-        f"Using length_prefix_future: {cfg.length_prefix_future}"
+        f"Policy: length_prefix_future={length_prefix_future}, length_prefix_past={length_prefix_past}. "
+        f"threshold_remaining_actions={cfg.threshold_remaining_actions}"
     )
 
     # The future prefix starts at t_0 (observation timestep, already executing), so only d-1
     # actions absorb inference latency. With d=1 there's no interpolation target at chunk
     # switches while inference runs, causing the actor to hold the last action.
     is_interpolation_active = cfg.fps_interpolation > cfg.fps_policy
-    if is_interpolation_active and cfg.length_prefix_future < 2:
+    if is_interpolation_active and cfg.threshold_remaining_actions < 2:
         logging.warning(
             f"Interpolation is active (fps_interpolation={cfg.fps_interpolation} > fps_policy={cfg.fps_policy}) "
-            f"but length_prefix_future={cfg.length_prefix_future} < 2. If inference latency exceeds "
-            f"{cfg.length_prefix_future - 1} policy steps, there will be no interpolation target at chunk "
+            f"but threshold_remaining_actions={cfg.threshold_remaining_actions} < 2. If inference latency exceeds "
+            f"{cfg.threshold_remaining_actions - 1} policy steps, there will be no interpolation target at chunk "
             f"switches, causing the actor to hold the last action."
         )
 
@@ -827,7 +836,7 @@ def main(cfg: EvalAsyncSmoothConfig) -> None:
             f"Starting episode (max {cfg.episode_time_s}s at {cfg.fps_policy} fps policy, "
             f"{cfg.fps_interpolation} fps interpolation, {cfg.fps_observation} fps observation)"
         )
-        logging.info(f"Inference triggers when actions_remaining - 1 <= {cfg.length_prefix_future}")
+        logging.info(f"Inference triggers when actions_remaining <= {cfg.threshold_remaining_actions}")
 
         policy.reset()
         preprocessor.reset()
@@ -851,15 +860,15 @@ def main(cfg: EvalAsyncSmoothConfig) -> None:
         logging.info(f"Using n_action_steps: {n_action_steps}")
 
         # Ensure chunk is long enough to read past actions when inference triggers.
-        # Inference triggers when cnt_actions_remaining <= length_prefix_future,
-        # i.e. when remaining actions (including current) fit inside the future prefix.
-        # At trigger, current index = n_action_steps - length_prefix_future.
+        # Inference triggers when cnt_actions_remaining <= threshold_remaining_actions,
+        # i.e. when remaining actions (including current) are at or below the threshold.
+        # At trigger, current index = n_action_steps - threshold_remaining_actions.
         # We need current index >= length_prefix_past for the past prefix.
-        # Therefore: n_action_steps >= length_prefix_future + length_prefix_past
-        min_n_action_steps = cfg.length_prefix_future + length_prefix_past
+        # Therefore: n_action_steps >= threshold_remaining_actions + length_prefix_past
+        min_n_action_steps = cfg.threshold_remaining_actions + length_prefix_past
         if n_action_steps < min_n_action_steps:
             raise ValueError(
-                f"n_action_steps ({n_action_steps}) must be >= length_prefix_future ({cfg.length_prefix_future}) "
+                f"n_action_steps ({n_action_steps}) must be >= threshold_remaining_actions ({cfg.threshold_remaining_actions}) "
                 f"+ length_prefix_past ({length_prefix_past}) = {min_n_action_steps}"
             )
 
@@ -920,6 +929,7 @@ def main(cfg: EvalAsyncSmoothConfig) -> None:
                 camera_names,
                 tracker_latency,
                 robot_type,
+                length_prefix_future,
                 length_prefix_past,
             ),
             daemon=True,

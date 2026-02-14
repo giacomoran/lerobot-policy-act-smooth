@@ -7,6 +7,8 @@
 #   ./eval.sh --policy=lerobot_policy_act_smooth_30fps_smooth_p4f2 --eval=async_smooth
 #   ./eval.sh --policy=lerobot_policy_act_smooth_10fps_vanilla --eval=sync
 #   ./eval.sh --policy=lerobot_policy_act_smooth_30fps_vanilla --eval=sync --checkpoint=030003
+#   ./eval.sh --policy=lerobot_policy_act_smooth_10fps_smooth_p1f4 --eval=async_smooth --delay_ms_injected=100
+#   ./eval.sh --policy=lerobot_policy_act_smooth_30fps_smooth_p4f8 --eval=async_smooth --threshold_remaining_actions=2
 #
 # The policy fps is extracted from the policy name (e.g. "10fps" -> 10).
 #
@@ -22,9 +24,10 @@ set -e
 FPS_INTERPOLATION=30
 FPS_OBSERVATION=60
 DISPLAY_DATA=true
-THRESHOLD_REMAINING_ACTIONS=2
 EPISODE_TIME_S=30
 CHECKPOINT="030003"
+DELAY_MS_INJECTED=0
+THRESHOLD_REMAINING_ACTIONS=""
 
 CAMERAS="{
   wrist: { type: opencv, index_or_path: 1, width: 480, height: 640, fps: 30, rotation: -90 },
@@ -49,11 +52,17 @@ for arg in "$@"; do
     --episode_time_s=*)
       EPISODE_TIME_S="${arg#*=}"
       ;;
+    --delay_ms_injected=*)
+      DELAY_MS_INJECTED="${arg#*=}"
+      ;;
+    --threshold_remaining_actions=*)
+      THRESHOLD_REMAINING_ACTIONS="${arg#*=}"
+      ;;
   esac
 done
 
 if [[ -z "$NAME_POLICY" || -z "$VARIANT_EVAL" ]]; then
-  echo "Usage: $0 --policy=<policy_name> --eval=<sync|sync_discard|async_smooth|async_discard> [--checkpoint=030003] [--episode_time_s=30]"
+  echo "Usage: $0 --policy=<policy_name> --eval=<sync|sync_discard|async_smooth|async_discard> [--checkpoint=030003] [--episode_time_s=30] [--delay_ms_injected=0] [--threshold_remaining_actions=N]"
   exit 1
 fi
 
@@ -83,6 +92,7 @@ PATH_RECORDING="${DIR_RECORDING}/${PREFIX_RECORDING}_$(printf '%03d' $IDX_RUN).r
 
 echo "Policy:    $NAME_POLICY (${FPS_POLICY}fps, checkpoint ${CHECKPOINT})"
 echo "Eval:      $VARIANT_EVAL"
+echo "Delay:     ${DELAY_MS_INJECTED}ms injected"
 echo "Recording: $PATH_RECORDING"
 
 # --- Dispatch ---
@@ -96,6 +106,7 @@ case "$VARIANT_EVAL" in
         --policy.path="$PATH_POLICY" \
         --fps_policy="$FPS_POLICY" \
         --fps_observation="$FPS_OBSERVATION" \
+        --delay_ms_injected="$DELAY_MS_INJECTED" \
         --episode_time_s="$EPISODE_TIME_S" \
         --display_data="$DISPLAY_DATA" \
         --path_recording="$PATH_RECORDING"
@@ -110,40 +121,52 @@ case "$VARIANT_EVAL" in
         --policy.path="$PATH_POLICY" \
         --fps_policy="$FPS_POLICY" \
         --fps_observation="$FPS_OBSERVATION" \
+        --delay_ms_injected="$DELAY_MS_INJECTED" \
         --episode_time_s="$EPISODE_TIME_S" \
         --display_data="$DISPLAY_DATA" \
         --path_recording="$PATH_RECORDING"
     ;;
 
   async_discard)
-    python scripts/eval/eval_async_discard.py \
-        --robot.type=so101_follower \
-        --robot.port=/dev/tty.usbmodem5A460829821 \
-        --robot.id=arm_follower_0 \
-        --robot.cameras="$CAMERAS" \
-        --policy.path="$PATH_POLICY" \
-        --fps_policy="$FPS_POLICY" \
-        --fps_interpolation="$FPS_INTERPOLATION" \
-        --fps_observation="$FPS_OBSERVATION" \
-        --threshold_remaining_actions="$THRESHOLD_REMAINING_ACTIONS" \
-        --episode_time_s="$EPISODE_TIME_S" \
-        --display_data="$DISPLAY_DATA" \
+    ARGS_ASYNC_DISCARD=(
+        --robot.type=so101_follower
+        --robot.port=/dev/tty.usbmodem5A460829821
+        --robot.id=arm_follower_0
+        --robot.cameras="$CAMERAS"
+        --policy.path="$PATH_POLICY"
+        --fps_policy="$FPS_POLICY"
+        --fps_interpolation="$FPS_INTERPOLATION"
+        --fps_observation="$FPS_OBSERVATION"
+        --delay_ms_injected="$DELAY_MS_INJECTED"
+        --episode_time_s="$EPISODE_TIME_S"
+        --display_data="$DISPLAY_DATA"
         --path_recording="$PATH_RECORDING"
+    )
+    if [[ -n "$THRESHOLD_REMAINING_ACTIONS" ]]; then
+        ARGS_ASYNC_DISCARD+=(--threshold_remaining_actions="$THRESHOLD_REMAINING_ACTIONS")
+    fi
+    python scripts/eval/eval_async_discard.py "${ARGS_ASYNC_DISCARD[@]}"
     ;;
 
   async_smooth)
-    python scripts/eval/eval_async_smooth.py \
-        --robot.type=so101_follower \
-        --robot.port=/dev/tty.usbmodem5A460829821 \
-        --robot.id=arm_follower_0 \
-        --robot.cameras="$CAMERAS" \
-        --policy.path="$PATH_POLICY" \
-        --fps_policy="$FPS_POLICY" \
-        --fps_interpolation="$FPS_INTERPOLATION" \
-        --fps_observation="$FPS_OBSERVATION" \
-        --episode_time_s="$EPISODE_TIME_S" \
-        --display_data="$DISPLAY_DATA" \
+    ARGS_ASYNC_SMOOTH=(
+        --robot.type=so101_follower
+        --robot.port=/dev/tty.usbmodem5A460829821
+        --robot.id=arm_follower_0
+        --robot.cameras="$CAMERAS"
+        --policy.path="$PATH_POLICY"
+        --fps_policy="$FPS_POLICY"
+        --fps_interpolation="$FPS_INTERPOLATION"
+        --fps_observation="$FPS_OBSERVATION"
+        --delay_ms_injected="$DELAY_MS_INJECTED"
+        --episode_time_s="$EPISODE_TIME_S"
+        --display_data="$DISPLAY_DATA"
         --path_recording="$PATH_RECORDING"
+    )
+    if [[ -n "$THRESHOLD_REMAINING_ACTIONS" ]]; then
+        ARGS_ASYNC_SMOOTH+=(--threshold_remaining_actions="$THRESHOLD_REMAINING_ACTIONS")
+    fi
+    python scripts/eval/eval_async_smooth.py "${ARGS_ASYNC_SMOOTH[@]}"
     ;;
 
   *)

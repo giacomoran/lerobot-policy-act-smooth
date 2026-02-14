@@ -69,6 +69,9 @@ class EvalSyncConfig:
     # Override n_action_steps from policy config (None = use policy default)
     n_action_steps: int | None = None
 
+    # Injected delay (ms) to simulate extra inference latency
+    delay_ms_injected: int = 0
+
     # Display and recording
     display_data: bool = False
     path_recording: str = ""
@@ -111,6 +114,7 @@ def run_inference_chunk(
     device: torch.device,
     n_action_steps: int,
     robot_type: str,
+    delay_ms_injected: int = 0,
 ) -> tuple[torch.Tensor, float]:
     """Run policy inference and return action chunk with timing.
 
@@ -121,11 +125,12 @@ def run_inference_chunk(
         device: Torch device for inference
         n_action_steps: Number of actions to return from the chunk
         robot_type: Robot type identifier
+        delay_ms_injected: Extra sleep (ms) to simulate inference latency
 
     Returns:
         Tuple of (action_chunk, inference_time_ms) where:
         - action_chunk: [batch, n_action_steps, action_dim] tensor
-        - inference_time_ms: Time taken for inference in milliseconds
+        - inference_time_ms: Time taken for inference in milliseconds (includes injected delay)
     """
     ts_start = time.perf_counter()
 
@@ -140,6 +145,9 @@ def run_inference_chunk(
         # Use predict_action_chunk without prefix (works for both ACT and ACTSmooth)
         actions = policy.predict_action_chunk(observation)
         actions = actions[:, :n_action_steps, :]
+
+    if delay_ms_injected > 0:
+        time.sleep(delay_ms_injected / 1000.0)
 
     duration_ms_inference = (time.perf_counter() - ts_start) * 1000
     return actions, duration_ms_inference
@@ -210,6 +218,7 @@ def run_episode_sync(
         device=device,
         n_action_steps=n_action_steps,
         robot_type=robot_type,
+        delay_ms_injected=0,  # No injected delay for warmup
     )
     logging.info(f"Warmup inference: {duration_ms_warmup:.1f}ms")
 
@@ -244,6 +253,7 @@ def run_episode_sync(
             device=device,
             n_action_steps=n_action_steps,
             robot_type=robot_type,
+            delay_ms_injected=cfg.delay_ms_injected,
         )
 
         tracker_latency.record(duration_ms_inference, log_to_rerun=cfg.display_data)
